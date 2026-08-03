@@ -55,12 +55,15 @@ async def generate_candidates(
             {"role": "user", "content": user_prompt},
         ]
         try:
-            result = await client.chat(
-                model=cfg["model"],
-                messages=messages,
-                temperature=cfg.get("temperature", 0.3),
-                reasoning_effort=cfg.get("reasoning_effort", "none"),
-                max_tokens=2048,
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=cfg["model"],
+                    messages=messages,
+                    temperature=cfg.get("temperature", 0.3),
+                    reasoning_effort=cfg.get("reasoning_effort", "none"),
+                    max_tokens=1024,
+                ),
+                timeout=30,
             )
             return Candidate(
                 name=cfg["name"],
@@ -143,7 +146,7 @@ Revised answer (show reasoning):"""
                     messages=messages,
                     temperature=0.3,
                     reasoning_effort="none",
-                    max_tokens=2048,
+                    max_tokens=1024,
                 )
                 return rep.name, Candidate(
                     name=rep.name,
@@ -202,12 +205,15 @@ Respond ONLY with valid JSON."""
     ]
 
     try:
-        result = await client.chat(
-            model=judge_config["model"],
-            messages=messages,
-            temperature=judge_config.get("temperature", 0.1),
-            reasoning_effort=judge_config.get("reasoning_effort", "high"),
-            max_tokens=2048,
+        result = await asyncio.wait_for(
+            client.chat(
+                model=judge_config["model"],
+                messages=messages,
+                temperature=judge_config.get("temperature", 0.1),
+                reasoning_effort=judge_config.get("reasoning_effort", "none"),
+                max_tokens=1024,
+            ),
+            timeout=30,
         )
 
         try:
@@ -290,12 +296,15 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
     if verification_report and verification_report.all_passed:
         trace.append(f"Verification passed — running final synthesis ({winner.name})")
         try:
-            result = await client.chat(
-                model=synthesizer_config["model"],
-                messages=messages,
-                temperature=synthesizer_config.get("temperature", 0.2),
-                reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
-                max_tokens=2048,
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=synthesizer_config["model"],
+                    messages=messages,
+                    temperature=synthesizer_config.get("temperature", 0.2),
+                    reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
+                    max_tokens=1024,
+                ),
+                timeout=30,
             )
             answer = result.content
             trace.append(f"Synthesis done [{result.latency_ms:.0f}ms]")
@@ -304,12 +313,15 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
     else:
         for round_num in range(max_repair_rounds if failures else 1):
             try:
-                result = await client.chat(
-                    model=synthesizer_config["model"],
-                    messages=messages,
-                    temperature=synthesizer_config.get("temperature", 0.2),
-                    reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
-                    max_tokens=2048,
+                result = await asyncio.wait_for(
+                    client.chat(
+                        model=synthesizer_config["model"],
+                        messages=messages,
+                        temperature=synthesizer_config.get("temperature", 0.2),
+                        reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
+                        max_tokens=1024,
+                    ),
+                    timeout=30,
                 )
                 answer = result.content
                 trace.append(f"Synthesis/repair round {round_num + 1}: done [{result.latency_ms:.0f}ms]")

@@ -55,6 +55,10 @@ def main():
 
         result = asyncio.run(_ask())
 
+        if result.get("error") and not result.get("answer"):
+            print(f"Rejected: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+
         print(result["answer"])
         if result.get("pipeline_trace"):
             print("\n--- Pipeline Trace ---", file=sys.stderr)
