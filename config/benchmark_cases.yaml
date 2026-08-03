@@ -1,0 +1,32 @@
+BENCHMARK_TEST_CASES:
+  - id: math_simple
+    question: "What is 17 * 23?"
+    expected_answer: "391"
+
+  - id: math_word
+    question: "If a train travels 60 mph for 2.5 hours, then 80 mph for 1.5 hours, what total distance does it cover?"
+    expected_answer: "270"
+
+  - id: reasoning_logical
+    question: "All cats are mammals. Whiskers is a cat. What can we conclude about Whiskers?"
+    expected_answer: "Whiskers is a mammal"
+
+  - id: coding_python
+    question: "Write a Python function that returns the factorial of n using recursion. Include the function definition."
+    expected_answer: "def factorial"
+
+  - id: factual
+    question: "What is the capital of Australia?"
+    expected_answer: "Canberra"
+
+  - id: reasoning_multi_step
+    question: "If A > B, B > C, and C > D, and D = 5, what can we say about A's relationship to D?"
+    expected_answer: "A > D"
+
+  - id: optimization
+    question: "What is the time complexity of binary search and why?"
+    expected_answer: "O(log n)"
+
+  - id: edge_case_code
+    question: "Write a Python one-liner that reverses a string s."
+    expected_answer: "s[::-1]"

@@ -1,0 +1,97 @@
+candidates:
+  # Diverse perspectives — mix model families, not identical instances
+  - name: solver
+    model: deepseek-v4-flash
+    system_prompt: |
+      You are a precise problem solver. Analyze the problem carefully and provide
+      a rigorous solution. Show your reasoning step by step. State assumptions explicitly.
+    temperature: 0.3
+    reasoning_effort: none
+
+  - name: alternative_solver
+    model: deepseek-v4-flash
+    system_prompt: |
+      You are a problem solver who must use a fundamentally different approach
+      than the obvious one. If the standard approach is algebraic, try geometric.
+      If it's top-down, try bottom-up. Solve the problem using this alternative method.
+    temperature: 0.5
+    reasoning_effort: none
+
+  - name: adversarial_critic
+    model: deepseek-v4-flash
+    system_prompt: |
+      You are an adversarial critic. Your job is to find the WEAKEST point in
+      a proposed solution. Do not try to solve the problem yourself. Instead,
+      identify the single most likely error, incorrect assumption, or unsupported
+      claim. Be specific about what would fail and why.
+    temperature: 0.2
+    reasoning_effort: none
+
+  - name: evidence_verifier
+    model: deepseek-v4-flash
+    system_prompt: |
+      You are an evidence verifier. For each claim in a proposed solution, classify
+      it as VERIFIED (can be checked externally), PLAUSIBLE (logical but uncheckable),
+      or UNVERIFIED (needs external confirmation). List specific verification actions
+      that could be taken (tests to run, facts to look up, calculations to recheck).
+    temperature: 0.2
+    reasoning_effort: none
+
+  - name: devil_advocate
+    model: deepseek-v4-flash
+    system_prompt: |
+      You are a devil's advocate. You must argue the opposite conclusion from
+      the mainstream answer. Even if you believe the standard answer is right,
+      construct the strongest possible counterargument. This forces the system
+      to not converge on a confident wrong answer.
+    temperature: 0.7
+    reasoning_effort: none
+
+judge:
+  model: deepseek-v4-flash
+  system_prompt: |
+    You are a judge evaluating multiple candidate solutions to a problem.
+    Rank each candidate on a scale of 0-10 using this rubric:
+    1. Correctness: Is the answer/logic actually correct?
+    2. Completeness: Does it address all parts of the question?
+    3. Rigor: Are steps justified and assumptions stated?
+    4. Verification survival: Do the claims survive scrutiny?
+    
+    Output strict JSON:
+    {"rankings": [{"candidate": "<name>", "score": <0-10>, "flaws": "<...>"}, ...],
+     "winner": "<name>",
+     "confidence": <0-1>,
+     "disagreement_level": "<none|low|high>"}
+  temperature: 0.1
+  reasoning_effort: none
+
+synthesizer:
+  model: deepseek-v4-flash
+  system_prompt: |
+    You are a synthesizer. Given the winning candidate solution, the adversarial
+    critique, and the verification results, produce the final answer. If the winner
+    has unverified or failed checks, note the uncertainty. If external checks failed,
+    repair the specific failures. Do not rewrite what is already correct.
+  temperature: 0.2
+  reasoning_effort: none
+
+difficulty_router:
+  simple_keywords:
+    - "what is"
+    - "define"
+    - "list"
+    - "who is"
+    - "when did"
+    - "convert"
+    - "format"
+  complexity_signals:
+    - "prove"
+    - "optimize"
+    - "design"
+    - "analyze"
+    - "debug"
+    - "refactor"
+    - "architect"
+    - "compare and contrast"
+    - "trade-off"
+  max_prompt_length_simple: 500
