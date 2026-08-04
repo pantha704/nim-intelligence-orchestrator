@@ -29,6 +29,11 @@ class SynthesizerConfig(BaseModel):
     reasoning_effort: str = "high"
 
 
+class TaskCompilerConfig(BaseModel):
+    model: str = "deepseek-v4-flash"
+    timeout_seconds: int = 25
+
+
 class DifficultyRouterConfig(BaseModel):
     simple_keywords: list[str] = Field(default_factory=list)
     complexity_signals: list[str] = Field(default_factory=list)
@@ -44,6 +49,7 @@ class Settings(BaseModel):
     judge: JudgeConfig | None = None
     synthesizer: SynthesizerConfig | None = None
     difficulty_router: DifficultyRouterConfig = Field(default_factory=DifficultyRouterConfig)
+    task_compiler: TaskCompilerConfig = TaskCompilerConfig()
     candidate_count: int = 5
     debate_rounds: int = 2
     refine_rounds: int = 2

@@ -1,10 +1,12 @@
 import asyncio
 from pathlib import Path
+from typing import Optional
 
-from .config import Settings
-from .input_gate import GateAction, gate_prompt
+from .config import Settings, load_settings
 from .router_client import RouterClient, StreamConfig
 from .speculative_router import SpeculativeResult, speculative_route
+from .task_compiler import TaskCompilerResult, TaskSpec, compile_task
+from .transport_gate import TransportGateResult, transport_gate
 
 
 async def handle_intelligence_request(
@@ -13,21 +15,20 @@ async def handle_intelligence_request(
     raw_prompt: str,
     force_mode: str | None = None,
 ) -> dict:
-    """Main entry point. Runs input gate → speculative route → full pipeline."""
+    """Main entry point. Pipeline: transport gate → task compiler → route → pipeline."""
 
-    # --- Stage 0: Input gate ---
-    gate = gate_prompt(raw_prompt)
-
-    if gate.action == GateAction.REJECT:
+    # --- Stage 0: Transport gate (minimal — size, encoding, emptiness only) ---
+    gate = transport_gate(raw_prompt)
+    if not gate.ok:
         return {
             "answer": "",
             "error": gate.reason,
             "mode": "rejected",
-            "safety_flag": gate.safety_flag,
             "pipeline_trace": [f"REJECTED: {gate.reason}"],
         }
 
-    prompt = gate.prompt
+    # raw_prompt is preserved immutably — never modified
+    prompt = gate.raw_prompt
 
     if force_mode == "single":
         result = await client.chat(
@@ -35,77 +36,91 @@ async def handle_intelligence_request(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=256,
-            stream_config=StreamConfig(
-                max_tokens=256,
-                min_tokens=8,
-                stop_on_double_newline=True,
-                stop_on_code_fence_close=True,
-                early_stop_token_budget=128,
-            ),
         )
         return {
             "answer": result.content,
             "mode": "single",
-            "difficulty": "forced",
-            "safety_flag": gate.safety_flag,
             "latency_ms": round(result.latency_ms, 1),
             "pipeline_trace": ["forced single mode"],
         }
 
-    if force_mode == "full":
-        return await _run_full(client, settings, prompt, gate)
+    # --- Stage 1: Task Compiler ---
+    task_result = await compile_task(
+        client,
+        model=settings.task_compiler.model,
+        raw_prompt=prompt,
+        timeout_seconds=settings.task_compiler.timeout_seconds,
+    )
 
-    # --- Stage 1: Speculative routing ---
-    try:
-        spec = await asyncio.wait_for(
-            speculative_route(
-                client,
-                model="deepseek-v4-flash",
-                prompt=prompt,
-                max_quick_tokens=256,
-            ),
-            timeout=15,
-        )
-    except TimeoutError:
-        trace = ["Speculative route timed out (15s) — escalating to full pipeline"]
-        spec = None
-        return await _run_full(client, settings, prompt, gate, None, trace)
-    except Exception as e:
-        trace = [f"Speculative route failed ({type(e).__name__}) — escalating"]
-        spec = None
-        return await _run_full(client, settings, prompt, gate, None, trace)
+    task_spec = task_result.task_spec
+    trace = [
+        f"Task compiled: route={task_spec.recommended_route}, risk={task_spec.risk_level}, "
+        f"subtasks={len(task_spec.subtasks)}, ambiguities={len(task_spec.ambiguities)} "
+        f"[{task_result.latency_ms:.0f}ms]",
+    ]
 
-    trace = [f"Speculative route: {spec.reason} (confidence={spec.confidence:.2f})"]
-
-    if not spec.escalate:
+    # Ambiguity check — ask one question if a high-impact ambiguity needs clarification
+    if task_result.needs_clarification:
+        trace.append(f"Clarification needed: {task_result.clarification_question}")
         return {
-            "answer": spec.quick_answer,
-            "mode": "speculative_direct",
-            "difficulty": "simple",
-            "safety_flag": gate.safety_flag,
-            "confidence": spec.confidence,
-            "latency_ms": round(spec.quick_result.latency_ms, 1) if spec.quick_result else 0,
+            "answer": "",
+            "mode": "needs_clarification",
+            "clarification_question": task_result.clarification_question,
+            "task_spec": task_spec.model_dump(),
             "pipeline_trace": trace,
         }
 
-    # --- Stage 2: Full pipeline ---
-    trace.append(f"Escalating from speculation (reason: {spec.reason})")
-    full_result = await _run_full(client, settings, prompt, gate, spec, trace)
-    return full_result
+    if task_spec.assumptions:
+        trace.append(f"Assumptions: {'; '.join(task_spec.assumptions[:3])}")
+
+    if force_mode == "full":
+        return await _run_full(client, settings, prompt, task_spec, trace)
+
+    # --- Stage 2: Route based on TaskSpec ---
+    route = task_spec.recommended_route
+
+    if route == "direct":
+        # Simple factual — try a quick direct response
+        spec = await speculative_route(
+            client, model="deepseek-v4-flash", prompt=prompt, max_quick_tokens=256,
+        )
+        trace.append(f"Speculative route: {spec.reason} (route={spec.route})")
+
+        if not spec.escalate:
+            return {
+                "answer": spec.quick_answer,
+                "mode": "direct",
+                "task_spec": task_spec.model_dump(),
+                "pipeline_trace": trace,
+                "latency_ms": round(spec.quick_result.latency_ms, 1) if spec.quick_result else 0,
+            }
+        # Fall through to full pipeline if speculative says escalate
+        return await _run_full(client, settings, prompt, task_spec, trace)
+
+    if route == "verifiable":
+        trace.append("Verifiable task — running full pipeline with verification")
+        return await _run_full(client, settings, prompt, task_spec, trace)
+
+    if route == "complex":
+        trace.append("Complex task — running full pipeline")
+        return await _run_full(client, settings, prompt, task_spec, trace)
+
+    if route == "open_ended":
+        trace.append("Open-ended task — running full pipeline")
+        return await _run_full(client, settings, prompt, task_spec, trace)
+
+    # Default: full pipeline
+    return await _run_full(client, settings, prompt, task_spec, trace)
 
 
 async def _run_full(
     client: RouterClient,
     settings: Settings,
     prompt: str,
-    gate,
-    spec: SpeculativeResult | None = None,
-    trace: list[str] | None = None,
+    task_spec: TaskSpec,
+    trace: list[str],
 ) -> dict:
     from .pipeline.full_pipeline import run_full_pipeline
-
-    if trace is None:
-        trace = []
 
     candidates_config = [
         {
@@ -146,8 +161,7 @@ async def _run_full(
     return {
         "answer": result.answer,
         "mode": "full",
-        "difficulty": "complex",
-        "safety_flag": gate.safety_flag,
+        "task_spec": task_spec.model_dump(),
         "clusters": {
             "disagreement_level": result.clusters.disagreement_level if result.clusters else None,
             "num_clusters": len(result.clusters.clusters) if result.clusters else 0,
@@ -157,7 +171,6 @@ async def _run_full(
             "all_passed": result.verification_report.all_passed if result.verification_report else None,
             "failures": result.verification_report.failures if result.verification_report else [],
         },
-        "speculative_quick_answer": spec.quick_answer if spec else "",
         "latency_ms": round(result.total_latency_ms, 1),
         "pipeline_trace": trace,
     }

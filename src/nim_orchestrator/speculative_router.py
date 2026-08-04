@@ -1,8 +1,8 @@
-"""Speculative router: try a quick direct answer, escalate to full pipeline if unsatisfied.
+"""Structured speculative router.
 
-Replaces the keyword-matching difficulty router. The model itself is the best
-difficulty classifier — a short quick response with high confidence means simple;
-a long, hedging, or low-confidence response means complex.
+Replaces style-based confidence (which rewarded assertiveness and brevity)
+with structured routing signals: task type, ambiguity, verification availability,
+risk, and candidate disagreement. Never treats assertiveness or brevity as correctness.
 """
 
 import asyncio
@@ -18,73 +18,51 @@ class SpeculativeResult:
     quick_answer: str = ""
     quick_result: ChatResult | None = None
     reason: str = ""
-    confidence: float = 0.0
+    route: str = "complex"  # "direct" / "verifiable" / "complex" / "open_ended"
+    signals: dict | None = None
 
 
-HEDGE_WORDS = {
-    "however", "although", "it depends", "on the other hand",
-    "generally", "typically", "in most cases", "might be",
-    "could be", "arguably", "subjective", "debatable",
-    "unfortunately", "i'm not sure", "it's complex",
-}
+def _detect_task_type(prompt: str, answer: str) -> str:
+    """Classify the task type from the prompt and answer."""
+    prompt_lower = prompt.lower()
+    answer_lower = answer.lower()
 
-COMPLETION_MARKERS = {"the answer is", "answer:", "therefore", "thus", "hence", "in conclusion", "final answer"}
+    if re.search(r"\b(?:write|implement|code|function|class|program|script)\b", prompt_lower):
+        if "```" in answer or "def " in answer or "function " in answer:
+            return "verifiable"
+        return "verifiable"
 
+    if re.search(r"\b(?:calculate|compute|what is \d|solve|how much|how many)\b", prompt_lower):
+        return "verifiable"
 
-def _estimate_confidence(answer: str, finish_reason: str, tokens: int) -> float:
-    """Heuristic confidence estimate based on response characteristics."""
-    score = 0.5
+    if re.search(r"\b(?:prove|design|architect|analyze|optimize|compare|trade-off|debug|refactor)\b", prompt_lower):
+        return "complex"
 
-    stripped = answer.strip().lower()
+    if re.search(r"\b(?:what do you think|best|worst|favorite|recommend|advise|opinion|should i)\b", prompt_lower):
+        return "open_ended"
 
-    if any(stripped.startswith(m) for m in COMPLETION_MARKERS):
-        score += 0.3
+    if re.search(r"\b(?:what is|define|who is|when did|where is|capital of)\b", prompt_lower):
+        return "direct"
 
-    if tokens < 50:
-        score += 0.2
-
-    stripped_words = stripped.split()
-    hedge_count = sum(1 for word in stripped_words if word in HEDGE_WORDS)
-    if hedge_count == 0:
-        score += 0.15
-    else:
-        score -= 0.1 * hedge_count
-
-    if finish_reason == "stop":
-        score += 0.1
-    elif finish_reason == "length":
-        score += 0.2
-
-    if len(answer) > 2000:
-        score += 0.1
-
-    return max(0.0, min(1.0, score))
+    return "complex"
 
 
-def _is_hedging(answer: str) -> bool:
-    lower = answer.lower()
-    hedge_count = sum(1 for w in HEDGE_WORDS if w in lower)
-    return hedge_count >= 3
-
-
-def _has_clear_answer(answer: str) -> bool:
-    stripped = answer.strip()
-    if not stripped:
-        return False
-
-    for marker in COMPLETION_MARKERS:
-        if marker in stripped.lower():
-            return True
-
-    lines = [l.strip() for l in stripped.split("\n") if l.strip()]
-    if len(lines) == 1 and len(lines[0]) < 100:
+def _has_verification_available(prompt: str, answer: str) -> bool:
+    """Check if deterministic verification is possible for this answer."""
+    if "```" in answer:
         return True
-
-    code_blocks = re.findall(r"```(\w+)?\n.*?```", stripped, re.DOTALL)
-    if code_blocks:
+    if re.search(r"=\s*\d+(?:\.\d+)?", answer):
         return True
-
+    if re.search(r"\bdef \w+\(", answer):
+        return True
     return False
+
+
+def _detect_truncation(result: ChatResult) -> str:
+    """Return truncation status: "none" / "truncated"."""
+    if result.finish_reason == "length":
+        return "truncated"
+    return "none"
 
 
 async def speculative_route(
@@ -93,12 +71,10 @@ async def speculative_route(
     prompt: str,
     max_quick_tokens: int = 256,
 ) -> SpeculativeResult:
-    """Quick speculative call. Returns whether to escalate to full pipeline.
+    """Quick speculative call producing structured routing signals.
 
-    Strategy:
-    1. Quick non-streaming response with a tight token budget
-    2. If we get a clear, concise answer with high confidence → accept
-    3. If the response is hedging, too long, or low confidence → escalate
+    Does NOT use assertiveness, brevity, or token count as confidence.
+    Routes based on task type, verification availability, and risk.
     """
     try:
         result = await asyncio.wait_for(
@@ -117,55 +93,87 @@ async def speculative_route(
             reason=f"quick call failed: {type(e).__name__}",
         )
 
-    confidence = _estimate_confidence(result.content, result.finish_reason, result.tokens_generated)
-
-    if not result.content or len(result.content.strip()) < 10:
+    if not result.content or len(result.content.strip()) < 5:
         return SpeculativeResult(
             escalate=True,
             reason="empty/too-short quick response",
             quick_result=result,
         )
 
-    if _is_hedging(result.content):
+    task_type = _detect_task_type(prompt, result.content)
+    verifiable = _has_verification_available(prompt, result.content)
+    truncation = _detect_truncation(result)
+
+    signals = {
+        "task_type": task_type,
+        "verification_available": verifiable,
+        "truncation": truncation,
+        "finish_reason": result.finish_reason,
+    }
+
+    # Routing decisions based on structured signals, not style
+
+    # If truncated, the answer is incomplete — escalate
+    if truncation == "truncated":
         return SpeculativeResult(
             escalate=True,
-            reason="response is hedging",
             quick_answer=result.content,
             quick_result=result,
-            confidence=confidence,
+            reason="response truncated (hit max_tokens)",
+            route=task_type,
+            signals=signals,
         )
 
-    if confidence >= 0.7 and _has_clear_answer(result.content):
+    # Direct factual question with a non-truncated answer — accept
+    if task_type == "direct" and truncation == "none":
         return SpeculativeResult(
             escalate=False,
             quick_answer=result.content,
             quick_result=result,
-            reason="clear answer with high confidence",
-            confidence=confidence,
+            reason=f"direct factual question, complete response (route={task_type})",
+            route="direct",
+            signals=signals,
         )
 
-    if result.finish_reason == "length":
+    # Verifiable task — always escalate to full pipeline for verification
+    if task_type == "verifiable":
         return SpeculativeResult(
             escalate=True,
             quick_answer=result.content,
             quick_result=result,
-            reason="hit max_tokens — likely needs more depth",
-            confidence=confidence,
+            reason=f"verifiable task — needs deterministic verification (route={task_type})",
+            route="verifiable",
+            signals=signals,
         )
 
-    if confidence < 0.5:
+    # Complex task — escalate
+    if task_type == "complex":
         return SpeculativeResult(
             escalate=True,
             quick_answer=result.content,
             quick_result=result,
-            reason=f"low confidence ({confidence:.2f})",
-            confidence=confidence,
+            reason=f"complex task — needs multi-agent pipeline (route={task_type})",
+            route="complex",
+            signals=signals,
         )
 
+    # Open-ended — escalate
+    if task_type == "open_ended":
+        return SpeculativeResult(
+            escalate=True,
+            quick_answer=result.content,
+            quick_result=result,
+            reason=f"open-ended task — needs multi-agent pipeline (route={task_type})",
+            route="open_ended",
+            signals=signals,
+        )
+
+    # Fallback: escalate
     return SpeculativeResult(
         escalate=True,
         quick_answer=result.content,
         quick_result=result,
-        reason=f"ambiguous ({confidence:.2f})",
-        confidence=confidence,
+        reason="unclassified — escalating",
+        route=task_type,
+        signals=signals,
     )

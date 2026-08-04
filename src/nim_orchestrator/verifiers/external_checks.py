@@ -1,4 +1,4 @@
-import asyncio
+import ast
 import re
 from dataclasses import dataclass, field
 
@@ -26,71 +26,28 @@ class VerificationReport:
             )
 
 
-async def verify_code_blocks(answer: str) -> VerificationResult:
-    code_blocks = re.findall(r"```(\w+)?\n(.*?)```", answer, re.DOTALL)
+async def verify_code_execution_disabled(answer: str) -> VerificationResult:
+    """Code execution verification is disabled until a sandbox exists.
+
+    Running generated Python on the host is a security risk (RCE).
+    This function reports the fact that code blocks were found but could not be verified.
+    """
+    code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", answer, re.DOTALL)
     if not code_blocks:
         return VerificationResult(
-            verifier_name="code_blocks",
+            verifier_name="code_execution",
             passed=True,
             details="no code blocks found",
         )
-
-    python_blocks = [(lang, code) for lang, code in code_blocks if lang in ("python", "py", None)]
-    failed = []
-    for lang, code in python_blocks:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3", "-c", code,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode != 0:
-                failed.append(f"exit {proc.returncode}: {stderr.decode()[:200]}")
-        except TimeoutError:
-            failed.append("timeout (10s)")
-        except Exception as e:
-            failed.append(f"error: {e}")
-
-    if failed:
-        return VerificationResult(
-            verifier_name="code_blocks",
-            passed=False,
-            details="; ".join(failed),
-        )
     return VerificationResult(
-        verifier_name="code_blocks",
-        passed=True,
-        details=f"{len(python_blocks)} python block(s) ran successfully",
-    )
-
-
-async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
-    re.findall(r"[\d,]+\.?\d*", prompt)
-    equalities = re.findall(r"=\s*[\d,]+\.?\d*", answer)
-    if not equalities and not any(c in answer for c in "+-*/×÷"):
-        return VerificationResult(
-            verifier_name="arithmetic",
-            passed=True,
-            details="no arithmetic claims detected",
-        )
-
-    simple_calc = re.findall(r"answer\s+is\s+(\d[\d,]*\.?\d*)", answer, re.IGNORECASE)
-    if simple_calc:
-        return VerificationResult(
-            verifier_name="arithmetic",
-            passed=True,
-            details=f"extracted answer: {simple_calc[0]}",
-        )
-
-    return VerificationResult(
-        verifier_name="arithmetic",
-        passed=True,
-        details="arithmetic detected but no machine-checkable claim",
+        verifier_name="code_execution",
+        passed=False,
+        details=f"Code execution disabled — sandbox not yet implemented. {len(code_blocks)} code block(s) found but not verified.",
     )
 
 
 async def verify_python_syntax(answer: str) -> VerificationResult:
+    """Check that Python code blocks parse syntactically. AST only — never executes."""
     if "```" not in answer:
         return VerificationResult(
             verifier_name="python_syntax",
@@ -102,14 +59,9 @@ async def verify_python_syntax(answer: str) -> VerificationResult:
     failed = []
     for i, code in enumerate(code_blocks):
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3", "-c", f"import ast; ast.parse('''{code}''')",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-            if proc.returncode != 0:
-                failed.append(f"block {i}: {stderr.decode()[:150]}")
+            ast.parse(code)
+        except SyntaxError as e:
+            failed.append(f"block {i}: {e}")
         except Exception as e:
             failed.append(f"block {i}: {e}")
 
@@ -123,6 +75,107 @@ async def verify_python_syntax(answer: str) -> VerificationResult:
         verifier_name="python_syntax",
         passed=True,
         details=f"{len(code_blocks)} block(s) parse successfully",
+    )
+
+
+async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
+    """Parse arithmetic expressions and verify them by actual calculation.
+
+    Returns passed=True only when a calculation was performed and matched.
+    Returns passed with details starting with "UNVERIFIED" when no checkable
+    arithmetic is found — never reports PASSED without actually checking.
+    """
+
+    expressions = []
+
+    equality_patterns = [
+        r"(-?\d+(?:\.\d+)?)\s*([+\-*/×÷])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+        r"(-?\d+(?:\.\d+)?)\s*\+\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+        r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+        r"(-?\d+(?:\.\d+)?)\s*[×*]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+        r"(-?\d+(?:\.\d+)?)\s*[÷/]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+    ]
+
+    for pattern in equality_patterns:
+        for match in re.finditer(pattern, answer):
+            groups = match.groups()
+            if len(groups) == 4:
+                a, op, b, expected = groups
+                op_map = {"×": "*", "÷": "/", "+": "+", "-": "-", "*": "*", "/": "/"}
+                op_s = op_map.get(op, op)
+            elif len(groups) == 3 and "+" in match.group():
+                # Pattern 2: a + b = c
+                # We can't distinguish from generic here — skip overlaps
+                continue
+            else:
+                continue
+
+            try:
+                a_f = float(a)
+                b_f = float(b)
+                expected_f = float(expected)
+
+                if op_s == "+":
+                    actual = a_f + b_f
+                elif op_s == "-":
+                    actual = a_f - b_f
+                elif op_s == "*":
+                    actual = a_f * b_f
+                elif op_s == "/":
+                    if b_f == 0:
+                        expressions.append((match.group(), False, "division by zero"))
+                        continue
+                    actual = a_f / b_f
+                else:
+                    continue
+
+                if abs(actual - expected_f) < 0.01:
+                    expressions.append((match.group(), True, f"{a} {op} {b} = {expected} ✓"))
+                else:
+                    expressions.append((match.group(), False, f"{a} {op} {b} = {expected} ✗ (actual: {actual})"))
+            except Exception:
+                continue
+
+    answer_is_patterns = re.findall(
+        r"(?:answer|result)\s+is\s*:?\s*(\d+(?:\.\d+)?)",
+        answer, re.IGNORECASE,
+    )
+    prompt_numbers = re.findall(r"(\d+(?:\.\d+)?)", prompt)
+
+    if not expressions and not answer_is_patterns:
+        has_arith = any(c in answer for c in "+-*/×÷=")
+        if has_arith or prompt_numbers:
+            return VerificationResult(
+                verifier_name="arithmetic",
+                passed=True,
+                details="UNVERIFIED — arithmetic detected but no machine-checkable expression extracted",
+            )
+        return VerificationResult(
+            verifier_name="arithmetic",
+            passed=True,
+            details="no arithmetic claims detected",
+        )
+
+    failed = [s for _, ok, s in expressions if not ok]
+    verified = [s for _, ok, s in expressions if ok]
+
+    if expressions:
+        if failed:
+            return VerificationResult(
+                verifier_name="arithmetic",
+                passed=False,
+                details="; ".join(failed),
+            )
+        return VerificationResult(
+            verifier_name="arithmetic",
+            passed=True,
+            details=f"Verified {len(verified)} expression(s): {'; '.join(verified[:5])}",
+        )
+
+    return VerificationResult(
+        verifier_name="arithmetic",
+        passed=True,
+        details="UNVERIFIED — answer stated but no expression to verify against",
     )
 
 
@@ -170,8 +223,9 @@ async def verify_answer(
 ) -> VerificationReport:
     report = VerificationReport()
 
+    import asyncio
     checks = await asyncio.gather(
-        verify_code_blocks(answer),
+        verify_code_execution_disabled(answer),
         verify_python_syntax(answer),
         verify_arithmetic(answer, prompt),
         verify_safety(answer),

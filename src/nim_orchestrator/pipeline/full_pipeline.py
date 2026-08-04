@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -91,6 +92,106 @@ async def generate_candidates(
     return results
 
 
+async def critique_candidates(
+    client: RouterClient,
+    candidates_config: list[dict],
+    candidates: list[Candidate],
+    user_prompt: str,
+    trace: list[str],
+) -> dict:
+    """Run adversarial critic and evidence verifier on candidate answers.
+
+    Unlike the old pipeline that sent only the user_prompt, this function
+    receives the actual candidate answers so the critic can find weaknesses
+    and the evidence verifier can classify claims.
+    """
+
+    valid = [c for c in candidates if not c.error and c.content]
+    if not valid:
+        trace.append("Critique: no valid candidates to critique")
+        return {"critic": "", "evidence_verifier": ""}
+
+    candidate_text = "\n\n".join(
+        f"--- {c.name} ({c.model}) ---\n{c.content[:2000]}"
+        for c in valid
+    )
+
+    critic_config = None
+    evidence_config = None
+    for cfg in candidates_config:
+        role = cfg.get("role", cfg.get("name", "")).lower()
+        if "critic" in role:
+            critic_config = cfg
+        elif "evidence" in role or "verifier" in role:
+            evidence_config = cfg
+
+    results = {}
+
+    async def _run_critic():
+        if not critic_config:
+            return "critic", ""
+        messages = [
+            {"role": "system", "content": critic_config["system_prompt"]},
+            {"role": "user", "content": f"""Original problem: {user_prompt}
+
+Candidate answers to critique:
+{candidate_text}
+
+Identify weaknesses, errors, and gaps in these candidate answers. Be specific about which candidate has which issue."""},
+        ]
+        try:
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=critic_config["model"],
+                    messages=messages,
+                    temperature=critic_config.get("temperature", 0.3),
+                    reasoning_effort=critic_config.get("reasoning_effort", "none"),
+                    max_tokens=1024,
+                ),
+                timeout=30,
+            )
+            return "critic", result.content
+        except Exception as e:
+            trace.append(f"Critic error: {str(e)[:100]}")
+            return "critic", ""
+
+    async def _run_evidence():
+        if not evidence_config:
+            return "evidence_verifier", ""
+        messages = [
+            {"role": "system", "content": evidence_config["system_prompt"]},
+            {"role": "user", "content": f"""Original problem: {user_prompt}
+
+Candidate answers with claims to verify:
+{candidate_text}
+
+Extract factual claims from these answers and classify each as: VERIFIED, UNVERIFIABLE, or CONTRADICTED based on your knowledge."""},
+        ]
+        try:
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=evidence_config["model"],
+                    messages=messages,
+                    temperature=evidence_config.get("temperature", 0.1),
+                    reasoning_effort=evidence_config.get("reasoning_effort", "none"),
+                    max_tokens=1024,
+                ),
+                timeout=30,
+            )
+            return "evidence_verifier", result.content
+        except Exception as e:
+            trace.append(f"Evidence verifier error: {str(e)[:100]}")
+            return "evidence_verifier", ""
+
+    tasks = [_run_critic(), _run_evidence()]
+    task_results = await asyncio.gather(*tasks)
+    for name, content in task_results:
+        results[name] = content
+
+    trace.append(f"Critique done: critic={'yes' if results.get('critic') else 'no'}, evidence={'yes' if results.get('evidence_verifier') else 'no'}")
+    return results
+
+
 async def debate_disagreeing_candidates(
     client: RouterClient,
     clusters: ClusteringResult,
@@ -141,12 +242,15 @@ Revised answer (show reasoning):"""
             ]
 
             try:
-                result = await client.chat(
-                    model=rep.model,
-                    messages=messages,
-                    temperature=0.3,
-                    reasoning_effort="none",
-                    max_tokens=1024,
+                result = await asyncio.wait_for(
+                    client.chat(
+                        model=rep.model,
+                        messages=messages,
+                        temperature=0.3,
+                        reasoning_effort="none",
+                        max_tokens=1024,
+                    ),
+                    timeout=30,
                 )
                 return rep.name, Candidate(
                     name=rep.name,
@@ -183,19 +287,29 @@ async def judge_candidates(
         trace.append("Only 1 valid candidate — judge not needed")
         return {"winner": valid[0].name, "rankings": [], "confidence": 1.0, "disagreement_level": "none"}
 
+    # Randomize order and anonymize names to prevent name bias
+    shuffled = list(valid)
+    random.shuffle(shuffled)
+    anonymous_labels = [f"Candidate {chr(ord('A') + i)}" for i in range(len(shuffled))]
+    label_to_original = {}
+    for label, cand in zip(anonymous_labels, shuffled):
+        label_to_original[label] = cand.name
+
     candidate_summaries = "\n\n".join(
-        f"--- Candidate {i+1}: {c.name} ({c.model}) ---\n{c.content[:2000]}"
-        for i, c in enumerate(valid)
+        f"--- {label} ---\n{c.content[:2000]}"
+        for label, c in zip(anonymous_labels, shuffled)
     )
 
     judge_prompt = f"""Problem: {user_prompt}
 
-Here are {len(valid)} candidate solutions:
+Here are {len(shuffled)} candidate solutions:
 
 {candidate_summaries}
 
 Evaluate each candidate using your rubric. If the candidates agree, state that.
 If they disagree, identify the key disagreement point and who is right.
+
+Refer to candidates by their anonymous labels (Candidate A, Candidate B, etc.).
 
 Respond ONLY with valid JSON."""
 
@@ -235,7 +349,18 @@ Respond ONLY with valid JSON."""
             if json_match:
                 parsed = json_match
             else:
-                parsed = {"winner": valid[0].name, "rankings": [], "confidence": 0.5, "disagreement_level": "unknown", "raw": result.content[:500]}
+                parsed = {"winner": anonymous_labels[0], "rankings": [], "confidence": 0.5, "disagreement_level": "unknown", "raw": result.content[:500]}
+
+        # Map anonymous labels back to original candidate names
+        winner_label = parsed.get("winner", "")
+        if winner_label in label_to_original:
+            parsed["winner"] = label_to_original[winner_label]
+
+        if "rankings" in parsed and isinstance(parsed["rankings"], list):
+            parsed["rankings"] = [
+                label_to_original.get(r, r) if isinstance(r, str) else r
+                for r in parsed["rankings"]
+            ]
 
         trace.append(f"Judge: winner={parsed.get('winner', '?')}, confidence={parsed.get('confidence', '?')}")
         return parsed
@@ -361,6 +486,9 @@ async def run_full_pipeline(
 
     trace.append(f"Starting full pipeline for {len(candidates_config)} candidates")
     candidates = await generate_candidates(client, candidates_config, user_prompt, trace)
+
+    # Run adversarial critic and evidence verifier on candidate answers
+    critique = await critique_candidates(client, candidates_config, candidates, user_prompt, trace)
 
     clustering_result = cluster_candidates(candidates)
     trace.append(f"Clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
