@@ -44,20 +44,26 @@ async def handle_intelligence_request(
             "pipeline_trace": ["forced single mode"],
         }
 
-    # --- Stage 1: Task Compiler ---
-    task_result = await compile_task(
-        client,
-        model=settings.task_compiler.model,
-        raw_prompt=prompt,
-        timeout_seconds=settings.task_compiler.timeout_seconds,
-    )
+    # --- Stage 1: Task Compiler (with bypass for obvious simple queries) ---
+    from .task_compiler import should_bypass_compiler, bypass_task_spec
+
+    if should_bypass_compiler(prompt):
+        task_result = bypass_task_spec(prompt)
+        trace = ["Compiler bypassed — obvious simple query"]
+    else:
+        task_result = await compile_task(
+            client,
+            model=settings.task_compiler.model,
+            raw_prompt=prompt,
+            timeout_seconds=settings.task_compiler.timeout_seconds,
+        )
+        trace = [
+            f"Task compiled: route={task_result.task_spec.recommended_route}, risk={task_result.task_spec.risk_level}, "
+            f"subtasks={len(task_result.task_spec.subtasks)}, ambiguities={len(task_result.task_spec.ambiguities)} "
+            f"[{task_result.latency_ms:.0f}ms]",
+        ]
 
     task_spec = task_result.task_spec
-    trace = [
-        f"Task compiled: route={task_spec.recommended_route}, risk={task_spec.risk_level}, "
-        f"subtasks={len(task_spec.subtasks)}, ambiguities={len(task_spec.ambiguities)} "
-        f"[{task_result.latency_ms:.0f}ms]",
-    ]
 
     # Ambiguity check — ask one question if a high-impact ambiguity needs clarification
     if task_result.needs_clarification:
@@ -169,7 +175,10 @@ async def _run_full(
         "judge": result.judge_result,
         "verification": {
             "all_passed": result.verification_report.all_passed if result.verification_report else None,
+            "has_failures": result.verification_report.has_failures if result.verification_report else None,
+            "has_unverified": result.verification_report.has_unverified if result.verification_report else None,
             "failures": result.verification_report.failures if result.verification_report else [],
+            "unverified": result.verification_report.unverified if result.verification_report else [],
         },
         "latency_ms": round(result.total_latency_ms, 1),
         "pipeline_trace": trace,

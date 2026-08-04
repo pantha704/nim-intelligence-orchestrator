@@ -36,7 +36,10 @@ class PipelineResult:
             "judge": self.judge_result,
             "verification": {
                 "all_passed": self.verification_report.all_passed if self.verification_report else None,
+                "has_failures": self.verification_report.has_failures if self.verification_report else None,
+                "has_unverified": self.verification_report.has_unverified if self.verification_report else None,
                 "failures": self.verification_report.failures if self.verification_report else [],
+                "unverified": self.verification_report.unverified if self.verification_report else [],
             },
             "total_latency_ms": round(self.total_latency_ms, 1),
             "pipeline_trace": self.pipeline_trace,
@@ -99,12 +102,7 @@ async def critique_candidates(
     user_prompt: str,
     trace: list[str],
 ) -> dict:
-    """Run adversarial critic and evidence verifier on candidate answers.
-
-    Unlike the old pipeline that sent only the user_prompt, this function
-    receives the actual candidate answers so the critic can find weaknesses
-    and the evidence verifier can classify claims.
-    """
+    """Run adversarial critic and evidence verifier on candidate answers."""
 
     valid = [c for c in candidates if not c.error and c.content]
     if not valid:
@@ -119,11 +117,14 @@ async def critique_candidates(
     critic_config = None
     evidence_config = None
     for cfg in candidates_config:
-        role = cfg.get("role", cfg.get("name", "")).lower()
-        if "critic" in role:
-            critic_config = cfg
-        elif "evidence" in role or "verifier" in role:
-            evidence_config = cfg
+        name_lower = cfg.get("name", "").lower()
+        role = cfg.get("role", "").lower()
+        if "critic" in name_lower or "critic" in role:
+            if critic_config is None:
+                critic_config = cfg
+        if "evidence" in name_lower or "verifier" in name_lower or "verifier" in role:
+            if evidence_config is None:
+                evidence_config = cfg
 
     results = {}
 
@@ -280,6 +281,7 @@ async def judge_candidates(
     candidates: list[Candidate],
     user_prompt: str,
     trace: list[str],
+    critique: dict | None = None,
 ) -> dict:
 
     valid = [c for c in candidates if not c.error and c.content]
@@ -287,7 +289,6 @@ async def judge_candidates(
         trace.append("Only 1 valid candidate — judge not needed")
         return {"winner": valid[0].name, "rankings": [], "confidence": 1.0, "disagreement_level": "none"}
 
-    # Randomize order and anonymize names to prevent name bias
     shuffled = list(valid)
     random.shuffle(shuffled)
     anonymous_labels = [f"Candidate {chr(ord('A') + i)}" for i in range(len(shuffled))]
@@ -300,11 +301,21 @@ async def judge_candidates(
         for label, c in zip(anonymous_labels, shuffled)
     )
 
+    critique_section = ""
+    if critique and (critique.get("critic") or critique.get("evidence_verifier")):
+        critique_section = "\n\n--- Adversarial Critique ---\n"
+        if critique.get("critic"):
+            critique_section += f"Critic findings:\n{critique['critic'][:1000]}\n"
+        if critique.get("evidence_verifier"):
+            critique_section += f"Evidence verification:\n{critique['evidence_verifier'][:1000]}\n"
+        critique_section += "\nConsider these critiques when evaluating candidates."
+
     judge_prompt = f"""Problem: {user_prompt}
 
 Here are {len(shuffled)} candidate solutions:
 
 {candidate_summaries}
+{critique_section}
 
 Evaluate each candidate using your rubric. If the candidates agree, state that.
 If they disagree, identify the key disagreement point and who is right.
@@ -351,7 +362,6 @@ Respond ONLY with valid JSON."""
             else:
                 parsed = {"winner": anonymous_labels[0], "rankings": [], "confidence": 0.5, "disagreement_level": "unknown", "raw": result.content[:500]}
 
-        # Map anonymous labels back to original candidate names
         winner_label = parsed.get("winner", "")
         if winner_label in label_to_original:
             parsed["winner"] = label_to_original[winner_label]
@@ -379,19 +389,31 @@ async def synthesize_final(
     user_prompt: str,
     trace: list[str],
     max_repair_rounds: int = 2,
+    critique: dict | None = None,
 ) -> str:
 
     failures = verification_report.failures if verification_report else []
-    verification_summary = failure_text = ""
+    verification_summary = failure_text = unverified_text = ""
     if verification_report:
-        if verification_report.all_passed:
-            verification_summary = f"All external checks passed ({len(verification_report.results)} checks)"
-        else:
+        if verification_report.has_failures:
             failure_text = "\n".join(f"- {f}" for f in failures)
+        elif verification_report.has_unverified:
+            unverified_text = "\n".join(f"- {u}" for u in verification_report.unverified)
+            verification_summary = f"External checks: some items UNVERIFIED:\n{unverified_text}\nAnswer has not been fully verified."
+        else:
+            verification_summary = f"All external checks passed ({len(verification_report.results)} checks)"
 
     judge_summary = ""
     if judge_result:
         judge_summary = json.dumps(judge_result.__dict__ if hasattr(judge_result, '__dict__') else judge_result, indent=2)[:1000]
+
+    critique_section = ""
+    if critique and (critique.get("critic") or critique.get("evidence_verifier")):
+        critique_section = "\n\nAdversarial critique:\n"
+        if critique.get("critic"):
+            critique_section += f"{critique['critic'][:1000]}\n"
+        if critique.get("evidence_verifier"):
+            critique_section += f"Evidence: {critique['evidence_verifier'][:1000]}\n"
 
     verification_section = (
         f"The following checks FAILED and must be fixed:\n{failure_text}"
@@ -409,8 +431,10 @@ Judge evaluation:
 
 External verification:
 {verification_section}
+{critique_section}
 
-If external checks failed, repair ONLY the specific failures. Do not rewrite content that passed verification."""
+If external checks failed, repair ONLY the specific failures. Do not rewrite content that passed verification.
+If items are UNVERIFIED, note the uncertainty but do not rewrite unless there is a specific failure."""
 
     messages = [
         {"role": "system", "content": synthesizer_config["system_prompt"]},
@@ -418,7 +442,11 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
     ]
 
     answer = winner.content
-    if verification_report and verification_report.all_passed:
+    
+    needs_repair = verification_report and verification_report.has_failures
+    needs_synthesis = verification_report and verification_report.all_passed and not verification_report.has_unverified
+    
+    if needs_synthesis:
         trace.append(f"Verification passed — running final synthesis ({winner.name})")
         try:
             result = await asyncio.wait_for(
@@ -435,7 +463,7 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
             trace.append(f"Synthesis done [{result.latency_ms:.0f}ms]")
         except Exception as e:
             trace.append(f"Synthesis error (keeping winner): {str(e)[:100]}")
-    else:
+    elif needs_repair:
         for round_num in range(max_repair_rounds if failures else 1):
             try:
                 result = await asyncio.wait_for(
@@ -452,8 +480,8 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
                 trace.append(f"Synthesis/repair round {round_num + 1}: done [{result.latency_ms:.0f}ms]")
 
                 repair_verif = await verify_answer(answer, user_prompt)
-                if repair_verif.all_passed:
-                    trace.append("Repair successful — all checks now pass")
+                if not repair_verif.has_failures:
+                    trace.append("Repair successful — no failures remain")
                     break
                 else:
                     trace.append(f"Repair round {round_num + 1} still has failures: {repair_verif.failures}")
@@ -466,6 +494,24 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
             except Exception as e:
                 trace.append(f"Synthesis error: {str(e)[:100]}")
                 break
+    else:
+        # Has unverified items but no failures — do a light synthesis noting uncertainty
+        trace.append(f"Running synthesis with unverified items ({winner.name})")
+        try:
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=synthesizer_config["model"],
+                    messages=messages,
+                    temperature=synthesizer_config.get("temperature", 0.2),
+                    reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
+                    max_tokens=1024,
+                ),
+                timeout=30,
+            )
+            answer = result.content
+            trace.append(f"Synthesis done [{result.latency_ms:.0f}ms]")
+        except Exception as e:
+            trace.append(f"Synthesis error (keeping winner): {str(e)[:100]}")
 
     return answer
 
@@ -484,24 +530,47 @@ async def run_full_pipeline(
     t0 = time.monotonic()
     trace: list[str] = []
 
-    trace.append(f"Starting full pipeline for {len(candidates_config)} candidates")
-    candidates = await generate_candidates(client, candidates_config, user_prompt, trace)
+    # Separate solver candidates from reviewer candidates
+    solver_configs = []
+    reviewer_configs = []
+    for cfg in candidates_config:
+        role = cfg.get("role", cfg.get("name", "")).lower()
+        name_lower = cfg.get("name", "").lower()
+        is_reviewer = any(k in role or k in name_lower for k in ("critic", "evidence", "verifier", "devil"))
+        if is_reviewer:
+            reviewer_configs.append(cfg)
+        else:
+            solver_configs.append(cfg)
 
-    # Run adversarial critic and evidence verifier on candidate answers
-    critique = await critique_candidates(client, candidates_config, candidates, user_prompt, trace)
+    if not solver_configs:
+        solver_configs = candidates_config
+
+    trace.append(f"Starting full pipeline: {len(solver_configs)} solvers, {len(reviewer_configs)} reviewers")
+
+    candidates = await generate_candidates(client, solver_configs, user_prompt, trace)
+
+    critique = await critique_candidates(
+        client,
+        reviewer_configs if reviewer_configs else candidates_config,
+        candidates,
+        user_prompt,
+        trace,
+    )
 
     clustering_result = cluster_candidates(candidates)
     trace.append(f"Clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
 
     if clustering_result.disagreement_level == "high":
         candidates = await debate_disagreeing_candidates(
-            client, clustering_result, candidates_config, candidates,
+            client, clustering_result, solver_configs, candidates,
             user_prompt, debate_rounds, trace,
         )
         clustering_result = cluster_candidates(candidates)
         trace.append(f"Post-debate clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
 
-    judge_result = await judge_candidates(client, judge_config, candidates, user_prompt, trace)
+    judge_result = await judge_candidates(
+        client, judge_config, candidates, user_prompt, trace, critique=critique,
+    )
 
     winner_name = judge_result.get("winner", "")
     winner = None
@@ -525,11 +594,16 @@ async def run_full_pipeline(
             )
 
     verification = await verify_answer(winner.content, user_prompt, verification_timeout)
-    trace.append(f"Verification: {'PASSED' if verification.all_passed else 'FAILED'} ({len(verification.results)} checks)")
+    if verification.has_failures:
+        trace.append(f"Verification: FAILED ({len(verification.results)} checks, {len(verification.failures)} failures)")
+    elif verification.has_unverified:
+        trace.append(f"Verification: UNVERIFIED items ({len(verification.unverified)} unverified, 0 failures)")
+    else:
+        trace.append(f"Verification: PASSED ({len(verification.results)} checks)")
 
     final_answer = await synthesize_final(
         client, synthesizer_config, winner, judge_result, verification,
-        user_prompt, trace, max_repair_rounds,
+        user_prompt, trace, max_repair_rounds, critique=critique,
     )
 
     return PipelineResult(

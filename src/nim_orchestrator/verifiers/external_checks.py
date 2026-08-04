@@ -1,47 +1,66 @@
 import ast
 import re
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
 class VerificationResult:
     verifier_name: str
-    passed: bool
+    status: Literal["pass", "fail", "unverified"] = "unverified"
     details: str = ""
     error: str = ""
+
+    @property
+    def passed(self) -> bool:
+        """Backward compat: True only when explicitly verified and correct."""
+        return self.status == "pass"
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "fail"
 
 
 @dataclass
 class VerificationReport:
     results: list[VerificationResult] = field(default_factory=list)
-    all_passed: bool = True
+    all_passed: bool = False
+    has_failures: bool = False
+    has_unverified: bool = False
     failures: list[str] = field(default_factory=list)
+    unverified: list[str] = field(default_factory=list)
 
     def add(self, result: VerificationResult) -> None:
         self.results.append(result)
-        if not result.passed:
-            self.all_passed = False
+        if result.status == "fail":
+            self.has_failures = True
             self.failures.append(
                 f"{result.verifier_name}: {result.details or result.error}"
             )
+        elif result.status == "unverified":
+            self.has_unverified = True
+            self.unverified.append(
+                f"{result.verifier_name}: {result.details}"
+            )
+        # Recompute all_passed: True only when at least one check passed AND none failed
+        self.all_passed = (
+            any(r.status == "pass" for r in self.results)
+            and not self.has_failures
+        )
 
 
 async def verify_code_execution_disabled(answer: str) -> VerificationResult:
-    """Code execution verification is disabled until a sandbox exists.
-
-    Running generated Python on the host is a security risk (RCE).
-    This function reports the fact that code blocks were found but could not be verified.
-    """
+    """Code execution verification is disabled until a sandbox exists."""
     code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", answer, re.DOTALL)
     if not code_blocks:
         return VerificationResult(
             verifier_name="code_execution",
-            passed=True,
+            status="pass",
             details="no code blocks found",
         )
     return VerificationResult(
         verifier_name="code_execution",
-        passed=False,
+        status="unverified",
         details=f"Code execution disabled — sandbox not yet implemented. {len(code_blocks)} code block(s) found but not verified.",
     )
 
@@ -51,29 +70,29 @@ async def verify_python_syntax(answer: str) -> VerificationResult:
     if "```" not in answer:
         return VerificationResult(
             verifier_name="python_syntax",
-            passed=True,
+            status="pass",
             details="no code blocks to check",
         )
 
     code_blocks = re.findall(r"```(?:\w+)?\n(.*?)```", answer, re.DOTALL)
-    failed = []
+    failed_blocks = []
     for i, code in enumerate(code_blocks):
         try:
             ast.parse(code)
         except SyntaxError as e:
-            failed.append(f"block {i}: {e}")
+            failed_blocks.append(f"block {i}: {e}")
         except Exception as e:
-            failed.append(f"block {i}: {e}")
+            failed_blocks.append(f"block {i}: {e}")
 
-    if failed:
+    if failed_blocks:
         return VerificationResult(
             verifier_name="python_syntax",
-            passed=False,
-            details="; ".join(failed),
+            status="fail",
+            details="; ".join(failed_blocks),
         )
     return VerificationResult(
         verifier_name="python_syntax",
-        passed=True,
+        status="pass",
         details=f"{len(code_blocks)} block(s) parse successfully",
     )
 
@@ -81,9 +100,10 @@ async def verify_python_syntax(answer: str) -> VerificationResult:
 async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
     """Parse arithmetic expressions and verify them by actual calculation.
 
-    Returns passed=True only when a calculation was performed and matched.
-    Returns passed with details starting with "UNVERIFIED" when no checkable
-    arithmetic is found — never reports PASSED without actually checking.
+    Three states:
+    - "pass": a calculation was performed and matched
+    - "fail": a calculation was performed and did NOT match
+    - "unverified": no machine-checkable arithmetic was found
     """
 
     expressions = []
@@ -104,8 +124,6 @@ async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
                 op_map = {"×": "*", "÷": "/", "+": "+", "-": "-", "*": "*", "/": "/"}
                 op_s = op_map.get(op, op)
             elif len(groups) == 3 and "+" in match.group():
-                # Pattern 2: a + b = c
-                # We can't distinguish from generic here — skip overlaps
                 continue
             else:
                 continue
@@ -147,12 +165,12 @@ async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
         if has_arith or prompt_numbers:
             return VerificationResult(
                 verifier_name="arithmetic",
-                passed=True,
+                status="unverified",
                 details="UNVERIFIED — arithmetic detected but no machine-checkable expression extracted",
             )
         return VerificationResult(
             verifier_name="arithmetic",
-            passed=True,
+            status="unverified",
             details="no arithmetic claims detected",
         )
 
@@ -163,24 +181,24 @@ async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
         if failed:
             return VerificationResult(
                 verifier_name="arithmetic",
-                passed=False,
+                status="fail",
                 details="; ".join(failed),
             )
         return VerificationResult(
             verifier_name="arithmetic",
-            passed=True,
+            status="pass",
             details=f"Verified {len(verified)} expression(s): {'; '.join(verified[:5])}",
         )
 
     return VerificationResult(
         verifier_name="arithmetic",
-        passed=True,
+        status="unverified",
         details="UNVERIFIED — answer stated but no expression to verify against",
     )
 
 
 async def verify_safety(answer: str) -> VerificationResult:
-    """Check if the answer contains unsafe content that the model should have refused."""
+    """Check if the answer contains unsafe content."""
     lower = answer.lower()
 
     patterns = {
@@ -193,7 +211,7 @@ async def verify_safety(answer: str) -> VerificationResult:
         if re.search(pattern, lower):
             return VerificationResult(
                 verifier_name="safety",
-                passed=False,
+                status="fail",
                 details=f"unsafe content detected: {name}",
             )
 
@@ -207,13 +225,13 @@ async def verify_safety(answer: str) -> VerificationResult:
         if phrase in lower:
             return VerificationResult(
                 verifier_name="safety",
-                passed=False,
+                status="fail",
                 details=f"unsafe content: matched '{phrase}'",
             )
 
     return VerificationResult(
         verifier_name="safety",
-        passed=True,
+        status="pass",
         details="no safety violations",
     )
 
@@ -238,7 +256,7 @@ async def verify_answer(
         elif isinstance(check, Exception):
             report.add(VerificationResult(
                 verifier_name="unknown",
-                passed=False,
+                status="fail",
                 error=str(check),
             ))
 

@@ -4,6 +4,7 @@ Distinguishes safely-assumable details from materially-ambiguous ones.
 Preserves the original prompt. Maintains a requirement ledger.
 """
 import json
+import re
 import time
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -144,33 +145,114 @@ async def compile_task(client: RouterClient, model: str, raw_prompt: str,
         )
 
 
-def _parse_task_spec(raw_json: str, original_prompt: str) -> TaskSpec:
+# Thresholds for compiler bypass — avoids 8-11s latency for obvious simple queries
+_BYPASS_MAX_LENGTH = 100
+_BYPASS_KEYWORDS = {
+    "what is", "who is", "when did", "where is", "capital of",
+    "define", "how many",
+}
+
+
+def should_bypass_compiler(raw_prompt: str) -> bool:
+    """Return True for clearly simple, low-risk prompts that can skip the Task Compiler.
+
+    Criteria: short, starts with a simple factual keyword, no ambiguity signals,
+    no compound requests, no code, no special instructions.
+    """
+    stripped = raw_prompt.strip()
+    if len(stripped) > _BYPASS_MAX_LENGTH:
+        return False
+    if "\n" in stripped:
+        return False
+    if "```" in stripped:
+        return False
+    lower = stripped.lower()
+    if not any(lower.startswith(kw) for kw in _BYPASS_KEYWORDS):
+        return False
+    if lower.count("?") > 1:
+        return False
+    if any(kw in lower for kw in (" and ", " or ", " vs ", " versus ")):
+        return False
+    if any(kw in lower for kw in ("write", "code", "function", "debug", "refactor", "analyze")):
+        return False
+    return True
+
+
+def bypass_task_spec(raw_prompt: str) -> TaskCompilerResult:
+    """Create a TaskSpec for obviously simple queries without a model call."""
+    return TaskCompilerResult(
+        task_spec=TaskSpec(
+            objective=raw_prompt,
+            context=raw_prompt,
+            risk_level="low",
+            recommended_route="direct",
+            assumptions=["Simple factual query — compiler bypassed"],
+        ),
+        latency_ms=0,
+    )
+
+
+def _extract_json(raw: str) -> dict | None:
+    """Extract JSON from raw model output, handling fenced blocks and multiline."""
+    # Try direct parse first
     try:
-        data = json.loads(raw_json)
+        return json.loads(raw)
     except json.JSONDecodeError:
-        for line in raw_json.split("\n"):
-            if "{" in line:
-                start = line.index("{")
-                for end in range(len(line), start, -1):
-                    try:
-                        data = json.loads(line[start:end])
-                        break
-                    except json.JSONDecodeError:
-                        continue
-                else:
+        pass
+
+    # Try extracting from fenced code block: ```json\n...\n``` or ```\n...\n```
+    fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", raw, re.DOTALL)
+    for block in fenced:
+        try:
+            return json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try extracting bare multiline JSON object (find outermost { ... })
+    depth = 0
+    start = -1
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidate = raw[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    start = -1
                     continue
-                break
-        else:
-            return TaskSpec(
-                objective=original_prompt[:200],
-                context=original_prompt,
-                recommended_route="complex",
-                risk_level="medium",
-            )
-    
-    if "context" not in data or not data["context"]:
-        data["context"] = original_prompt
-    
+
+    # Fallback: old single-line approach
+    for line in raw.split("\n"):
+        if "{" in line:
+            s = line.index("{")
+            for end in range(len(line), s, -1):
+                try:
+                    return json.loads(line[s:end])
+                except json.JSONDecodeError:
+                    continue
+
+    return None
+
+
+def _parse_task_spec(raw_json: str, original_prompt: str) -> TaskSpec:
+    data = _extract_json(raw_json)
+
+    if data is None:
+        return TaskSpec(
+            objective=original_prompt[:200],
+            context=original_prompt,
+            recommended_route="complex",
+            risk_level="medium",
+        )
+
+    # Force immutable original context — never trust model-generated context
+    data["context"] = original_prompt
+
     try:
         return TaskSpec(**data)
     except Exception:
@@ -180,14 +262,29 @@ def _parse_task_spec(raw_json: str, original_prompt: str) -> TaskSpec:
             _rl = "medium"
         if _rr not in ("direct", "verifiable", "complex", "open_ended"):
             _rr = "complex"
+
+        _ambiguities = []
+        for a in data.get("ambiguities", []):
+            try:
+                _ambiguities.append(Ambiguity(**a))
+            except Exception:
+                continue
+
+        _subtasks = []
+        for s in data.get("subtasks", []):
+            try:
+                _subtasks.append(Subtask(**s))
+            except Exception:
+                continue
+
         return TaskSpec(
             objective=data.get("objective", original_prompt[:200]),
             deliverables=data.get("deliverables", []),
             constraints=data.get("constraints", []),
             context=original_prompt,
             assumptions=data.get("assumptions", []),
-            ambiguities=[Ambiguity(**a) for a in data.get("ambiguities", [])],
-            subtasks=[Subtask(**s) for s in data.get("subtasks", [])],
+            ambiguities=_ambiguities,
+            subtasks=_subtasks,
             verification_plan=data.get("verification_plan", []),
             risk_level=_rl,
             recommended_route=_rr,
