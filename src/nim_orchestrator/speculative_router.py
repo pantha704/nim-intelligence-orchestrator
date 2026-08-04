@@ -32,8 +32,13 @@ def _detect_task_type(prompt: str, answer: str) -> str:
             return "verifiable"
         return "verifiable"
 
-    if re.search(r"\b(?:calculate|compute|what is \d|solve|how much|how many)\b", prompt_lower):
+    if re.search(r"\b(?:calculate|compute|solve|how much|how many)\b", prompt_lower):
         return "verifiable"
+
+    if re.search(r"\b(?:what is \d|what'?s \d)\b", prompt_lower):
+        # "What is 17 * 23?" — math question that the speculative answer can handle directly.
+        # Verification is available but the speculative answer is usually correct for arithmetic.
+        return "direct"
 
     if re.search(r"\b(?:prove|design|architect|analyze|optimize|compare|trade-off|debug|refactor)\b", prompt_lower):
         return "complex"

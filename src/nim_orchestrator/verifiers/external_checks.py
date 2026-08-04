@@ -29,6 +29,7 @@ class VerificationReport:
     has_unverified: bool = False
     failures: list[str] = field(default_factory=list)
     unverified: list[str] = field(default_factory=list)
+    status: str = "unverified"
 
     def add(self, result: VerificationResult) -> None:
         self.results.append(result)
@@ -47,6 +48,15 @@ class VerificationReport:
             any(r.status == "pass" for r in self.results)
             and not self.has_failures
         )
+        # Aggregate status: one unambiguous value for API consumers
+        if self.has_failures:
+            self.status = "failed"
+        elif self.all_passed and not self.has_unverified:
+            self.status = "passed"
+        elif self.all_passed and self.has_unverified:
+            self.status = "partial"
+        else:
+            self.status = "unverified"
 
 
 async def verify_code_execution_disabled(answer: str) -> VerificationResult:

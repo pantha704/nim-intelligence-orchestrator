@@ -174,6 +174,7 @@ async def _run_full(
         },
         "judge": result.judge_result,
         "verification": {
+            "status": result.verification_report.status if result.verification_report else None,
             "all_passed": result.verification_report.all_passed if result.verification_report else None,
             "has_failures": result.verification_report.has_failures if result.verification_report else None,
             "has_unverified": result.verification_report.has_unverified if result.verification_report else None,

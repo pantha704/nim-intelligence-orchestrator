@@ -35,6 +35,7 @@ class PipelineResult:
             },
             "judge": self.judge_result,
             "verification": {
+                "status": self.verification_report.status if self.verification_report else None,
                 "all_passed": self.verification_report.all_passed if self.verification_report else None,
                 "has_failures": self.verification_report.has_failures if self.verification_report else None,
                 "has_unverified": self.verification_report.has_unverified if self.verification_report else None,
@@ -95,101 +96,125 @@ async def generate_candidates(
     return results
 
 
+@dataclass
+class AnonMapping:
+    """Shared anonymization mapping used by reviewers, judge, and synthesizer."""
+    label_to_original: dict[str, str] = field(default_factory=dict)
+    original_to_label: dict[str, str] = field(default_factory=dict)
+    shuffled: list[Candidate] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
+
+    def label_of(self, candidate: Candidate) -> str:
+        return self.original_to_label.get(candidate.name, candidate.name)
+
+    def original_of(self, label: str) -> str:
+        return self.label_to_original.get(label, label)
+
+    def anon_text(self, max_chars: int = 2000) -> str:
+        return "\n\n".join(
+            f"--- {label} ---\n{c.content[:max_chars]}"
+            for label, c in zip(self.labels, self.shuffled)
+        )
+
+
+def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
+    """Create a shared shuffle + anonymous label mapping for the pipeline."""
+    valid = [c for c in candidates if not c.error and c.content]
+    shuffled = list(valid)
+    random.shuffle(shuffled)
+    labels = [f"Candidate {chr(ord('A') + i)}" for i in range(len(shuffled))]
+    mapping = AnonMapping(shuffled=shuffled, labels=labels)
+    for label, cand in zip(labels, shuffled):
+        mapping.label_to_original[label] = cand.name
+        mapping.original_to_label[cand.name] = label
+    return mapping
+
+
 async def critique_candidates(
     client: RouterClient,
-    candidates_config: list[dict],
+    reviewer_configs: list[dict],
     candidates: list[Candidate],
     user_prompt: str,
     trace: list[str],
+    anon: AnonMapping | None = None,
 ) -> dict:
-    """Run adversarial critic and evidence verifier on candidate answers."""
+    """Run adversarial critic, evidence verifier, and devil's advocate.
 
-    valid = [c for c in candidates if not c.error and c.content]
-    if not valid:
+    Reviewers see candidates under the same anonymous IDs used by the judge,
+    so their critiques can reference candidates the judge will recognize.
+    """
+
+    if not anon:
+        anon = create_anon_mapping(candidates)
+    if not anon.shuffled:
         trace.append("Critique: no valid candidates to critique")
-        return {"critic": "", "evidence_verifier": ""}
+        return {"critic": "", "evidence_verifier": "", "devil_advocate": ""}
 
-    candidate_text = "\n\n".join(
-        f"--- {c.name} ({c.model}) ---\n{c.content[:2000]}"
-        for c in valid
-    )
+    candidate_text = anon.anon_text(2000)
 
     critic_config = None
     evidence_config = None
-    for cfg in candidates_config:
+    devil_config = None
+    for cfg in reviewer_configs:
         name_lower = cfg.get("name", "").lower()
         role = cfg.get("role", "").lower()
         if "critic" in name_lower or "critic" in role:
             if critic_config is None:
                 critic_config = cfg
-        if "evidence" in name_lower or "verifier" in name_lower or "verifier" in role:
-            if evidence_config is None:
-                evidence_config = cfg
+        if ("evidence" in name_lower or "verifier" in name_lower) and evidence_config is None:
+            evidence_config = cfg
+        if ("devil" in name_lower or "devil" in role) and devil_config is None:
+            devil_config = cfg
 
     results = {}
 
-    async def _run_critic():
-        if not critic_config:
-            return "critic", ""
+    async def _run_reviewer(key, config, instruction):
+        if not config:
+            return key, ""
         messages = [
-            {"role": "system", "content": critic_config["system_prompt"]},
+            {"role": "system", "content": config["system_prompt"]},
             {"role": "user", "content": f"""Original problem: {user_prompt}
 
-Candidate answers to critique:
+Candidate answers:
 {candidate_text}
 
-Identify weaknesses, errors, and gaps in these candidate answers. Be specific about which candidate has which issue."""},
+{instruction}"""},
         ]
         try:
             result = await asyncio.wait_for(
                 client.chat(
-                    model=critic_config["model"],
+                    model=config["model"],
                     messages=messages,
-                    temperature=critic_config.get("temperature", 0.3),
-                    reasoning_effort=critic_config.get("reasoning_effort", "none"),
+                    temperature=config.get("temperature", 0.3),
+                    reasoning_effort=config.get("reasoning_effort", "none"),
                     max_tokens=1024,
                 ),
                 timeout=30,
             )
-            return "critic", result.content
+            return key, result.content
         except Exception as e:
-            trace.append(f"Critic error: {str(e)[:100]}")
-            return "critic", ""
+            trace.append(f"{key} error: {str(e)[:100]}")
+            return key, ""
 
-    async def _run_evidence():
-        if not evidence_config:
-            return "evidence_verifier", ""
-        messages = [
-            {"role": "system", "content": evidence_config["system_prompt"]},
-            {"role": "user", "content": f"""Original problem: {user_prompt}
-
-Candidate answers with claims to verify:
-{candidate_text}
-
-Extract factual claims from these answers and classify each as: VERIFIED, UNVERIFIABLE, or CONTRADICTED based on your knowledge."""},
-        ]
-        try:
-            result = await asyncio.wait_for(
-                client.chat(
-                    model=evidence_config["model"],
-                    messages=messages,
-                    temperature=evidence_config.get("temperature", 0.1),
-                    reasoning_effort=evidence_config.get("reasoning_effort", "none"),
-                    max_tokens=1024,
-                ),
-                timeout=30,
-            )
-            return "evidence_verifier", result.content
-        except Exception as e:
-            trace.append(f"Evidence verifier error: {str(e)[:100]}")
-            return "evidence_verifier", ""
-
-    tasks = [_run_critic(), _run_evidence()]
+    tasks = [
+        _run_reviewer("critic", critic_config,
+                      "Identify weaknesses, errors, and gaps in these candidate answers. "
+                      "Refer to candidates by their anonymous labels (Candidate A, Candidate B, etc.)."),
+        _run_reviewer("evidence_verifier", evidence_config,
+                      "Extract factual claims from these answers and classify each as: "
+                      "VERIFIED, UNVERIFIABLE, or CONTRADICTED. "
+                      "Refer to candidates by their anonymous labels."),
+        _run_reviewer("devil_advocate", devil_config,
+                      "Argue the opposite conclusion from the mainstream answer among these candidates. "
+                      "Construct the strongest possible counterargument. "
+                      "Refer to candidates by their anonymous labels."),
+    ]
     task_results = await asyncio.gather(*tasks)
-    for name, content in task_results:
-        results[name] = content
+    for key, content in task_results:
+        results[key] = content
 
-    trace.append(f"Critique done: critic={'yes' if results.get('critic') else 'no'}, evidence={'yes' if results.get('evidence_verifier') else 'no'}")
+    active = [k for k in ("critic", "evidence_verifier", "devil_advocate") if results.get(k)]
+    trace.append(f"Critique done: {', '.join(active) if active else 'none'}")
     return results
 
 
@@ -275,6 +300,37 @@ Revised answer (show reasoning):"""
     return updated
 
 
+def _extract_json_from_response(content: str) -> dict | None:
+    """Extract JSON from model response — handles plain, fenced, and multiline."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    import re
+    fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", content, re.DOTALL)
+    for block in fenced:
+        try:
+            return json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+    depth = 0
+    start = -1
+    for i, ch in enumerate(content):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(content[start : i + 1])
+                except json.JSONDecodeError:
+                    start = -1
+                    continue
+    return None
+
+
 async def judge_candidates(
     client: RouterClient,
     judge_config: dict,
@@ -282,37 +338,33 @@ async def judge_candidates(
     user_prompt: str,
     trace: list[str],
     critique: dict | None = None,
+    anon: AnonMapping | None = None,
 ) -> dict:
 
-    valid = [c for c in candidates if not c.error and c.content]
-    if len(valid) == 1:
+    if not anon:
+        anon = create_anon_mapping(candidates)
+
+    if len(anon.shuffled) <= 1:
         trace.append("Only 1 valid candidate — judge not needed")
-        return {"winner": valid[0].name, "rankings": [], "confidence": 1.0, "disagreement_level": "none"}
+        winner_name = anon.shuffled[0].name if anon.shuffled else ""
+        return {"winner": winner_name, "rankings": [], "confidence": 1.0, "disagreement_level": "none"}
 
-    shuffled = list(valid)
-    random.shuffle(shuffled)
-    anonymous_labels = [f"Candidate {chr(ord('A') + i)}" for i in range(len(shuffled))]
-    label_to_original = {}
-    for label, cand in zip(anonymous_labels, shuffled):
-        label_to_original[label] = cand.name
-
-    candidate_summaries = "\n\n".join(
-        f"--- {label} ---\n{c.content[:2000]}"
-        for label, c in zip(anonymous_labels, shuffled)
-    )
+    candidate_summaries = anon.anon_text(2000)
 
     critique_section = ""
-    if critique and (critique.get("critic") or critique.get("evidence_verifier")):
+    if critique and (critique.get("critic") or critique.get("evidence_verifier") or critique.get("devil_advocate")):
         critique_section = "\n\n--- Adversarial Critique ---\n"
         if critique.get("critic"):
             critique_section += f"Critic findings:\n{critique['critic'][:1000]}\n"
         if critique.get("evidence_verifier"):
             critique_section += f"Evidence verification:\n{critique['evidence_verifier'][:1000]}\n"
+        if critique.get("devil_advocate"):
+            critique_section += f"Devil's advocate counterargument:\n{critique['devil_advocate'][:1000]}\n"
         critique_section += "\nConsider these critiques when evaluating candidates."
 
     judge_prompt = f"""Problem: {user_prompt}
 
-Here are {len(shuffled)} candidate solutions:
+Here are {len(anon.shuffled)} candidate solutions:
 
 {candidate_summaries}
 {critique_section}
@@ -341,34 +393,17 @@ Respond ONLY with valid JSON."""
             timeout=30,
         )
 
-        try:
-            parsed = json.loads(result.content)
-        except json.JSONDecodeError:
-            json_match = None
-            for line in result.content.split("\n"):
-                if "{" in line:
-                    start = line.index("{")
-                    for end_idx in range(len(line), start, -1):
-                        try:
-                            parsed = json.loads(line[start:end_idx])
-                            json_match = parsed
-                            break
-                        except json.JSONDecodeError:
-                            continue
-                    if json_match:
-                        break
-            if json_match:
-                parsed = json_match
-            else:
-                parsed = {"winner": anonymous_labels[0], "rankings": [], "confidence": 0.5, "disagreement_level": "unknown", "raw": result.content[:500]}
+        parsed = _extract_json_from_response(result.content)
+        if parsed is None:
+            parsed = {"winner": anon.labels[0], "rankings": [], "confidence": 0.5,
+                     "disagreement_level": "unknown", "raw": result.content[:500]}
 
         winner_label = parsed.get("winner", "")
-        if winner_label in label_to_original:
-            parsed["winner"] = label_to_original[winner_label]
+        parsed["winner"] = anon.original_of(winner_label)
 
         if "rankings" in parsed and isinstance(parsed["rankings"], list):
             parsed["rankings"] = [
-                label_to_original.get(r, r) if isinstance(r, str) else r
+                anon.original_of(r) if isinstance(r, str) else r
                 for r in parsed["rankings"]
             ]
 
@@ -377,7 +412,8 @@ Respond ONLY with valid JSON."""
 
     except Exception as e:
         trace.append(f"Judge error: {str(e)[:100]}")
-        return {"winner": valid[0].name, "rankings": [], "confidence": 0.0, "disagreement_level": "error"}
+        fallback_winner = anon.shuffled[0].name if anon.shuffled else ""
+        return {"winner": fallback_winner, "rankings": [], "confidence": 0.0, "disagreement_level": "error"}
 
 
 async def synthesize_final(
@@ -390,6 +426,7 @@ async def synthesize_final(
     trace: list[str],
     max_repair_rounds: int = 2,
     critique: dict | None = None,
+    anon: AnonMapping | None = None,
 ) -> str:
 
     failures = verification_report.failures if verification_report else []
@@ -399,21 +436,24 @@ async def synthesize_final(
             failure_text = "\n".join(f"- {f}" for f in failures)
         elif verification_report.has_unverified:
             unverified_text = "\n".join(f"- {u}" for u in verification_report.unverified)
-            verification_summary = f"External checks: some items UNVERIFIED:\n{unverified_text}\nAnswer has not been fully verified."
+            verification_summary = f"External checks: some items UNVERIFIED:\n{unverified_text}\nAnswer has not been fully verified.\nAggregate status: {verification_report.status}"
         else:
             verification_summary = f"All external checks passed ({len(verification_report.results)} checks)"
 
     judge_summary = ""
     if judge_result:
-        judge_summary = json.dumps(judge_result.__dict__ if hasattr(judge_result, '__dict__') else judge_result, indent=2)[:1000]
+        judge_summary = json.dumps(judge_result, indent=2)[:1000]
 
     critique_section = ""
-    if critique and (critique.get("critic") or critique.get("evidence_verifier")):
+    if critique and (critique.get("critic") or critique.get("evidence_verifier") or critique.get("devil_advocate")):
+        winner_label = anon.label_of(winner) if anon else "winner"
         critique_section = "\n\nAdversarial critique:\n"
         if critique.get("critic"):
-            critique_section += f"{critique['critic'][:1000]}\n"
+            critique_section += f"Critic findings (re: {winner_label}):\n{critique['critic'][:1000]}\n"
         if critique.get("evidence_verifier"):
-            critique_section += f"Evidence: {critique['evidence_verifier'][:1000]}\n"
+            critique_section += f"Evidence (re: {winner_label}): {critique['evidence_verifier'][:1000]}\n"
+        if critique.get("devil_advocate"):
+            critique_section += f"Devil's advocate: {critique['devil_advocate'][:1000]}\n"
 
     verification_section = (
         f"The following checks FAILED and must be fixed:\n{failure_text}"
@@ -442,10 +482,10 @@ If items are UNVERIFIED, note the uncertainty but do not rewrite unless there is
     ]
 
     answer = winner.content
-    
+
     needs_repair = verification_report and verification_report.has_failures
     needs_synthesis = verification_report and verification_report.all_passed and not verification_report.has_unverified
-    
+
     if needs_synthesis:
         trace.append(f"Verification passed — running final synthesis ({winner.name})")
         try:
@@ -495,7 +535,6 @@ If items are UNVERIFIED, note the uncertainty but do not rewrite unless there is
                 trace.append(f"Synthesis error: {str(e)[:100]}")
                 break
     else:
-        # Has unverified items but no failures — do a light synthesis noting uncertainty
         trace.append(f"Running synthesis with unverified items ({winner.name})")
         try:
             result = await asyncio.wait_for(
@@ -549,12 +588,18 @@ async def run_full_pipeline(
 
     candidates = await generate_candidates(client, solver_configs, user_prompt, trace)
 
+    # Create shared anonymization mapping BEFORE reviewers so all agents use same labels
+    anon = create_anon_mapping(candidates)
+    trace.append(f"Anonymized {len(anon.shuffled)} candidates: " +
+                 ", ".join(f"{anon.labels[i]}={anon.shuffled[i].name}" for i in range(len(anon.shuffled))))
+
     critique = await critique_candidates(
         client,
         reviewer_configs if reviewer_configs else candidates_config,
         candidates,
         user_prompt,
         trace,
+        anon=anon,
     )
 
     clustering_result = cluster_candidates(candidates)
@@ -565,11 +610,13 @@ async def run_full_pipeline(
             client, clustering_result, solver_configs, candidates,
             user_prompt, debate_rounds, trace,
         )
+        # Re-anonymize after debate since candidates may have changed
+        anon = create_anon_mapping(candidates)
         clustering_result = cluster_candidates(candidates)
         trace.append(f"Post-debate clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
 
     judge_result = await judge_candidates(
-        client, judge_config, candidates, user_prompt, trace, critique=critique,
+        client, judge_config, candidates, user_prompt, trace, critique=critique, anon=anon,
     )
 
     winner_name = judge_result.get("winner", "")
@@ -594,16 +641,11 @@ async def run_full_pipeline(
             )
 
     verification = await verify_answer(winner.content, user_prompt, verification_timeout)
-    if verification.has_failures:
-        trace.append(f"Verification: FAILED ({len(verification.results)} checks, {len(verification.failures)} failures)")
-    elif verification.has_unverified:
-        trace.append(f"Verification: UNVERIFIED items ({len(verification.unverified)} unverified, 0 failures)")
-    else:
-        trace.append(f"Verification: PASSED ({len(verification.results)} checks)")
+    trace.append(f"Verification: {verification.status} ({len(verification.results)} checks)")
 
     final_answer = await synthesize_final(
         client, synthesizer_config, winner, judge_result, verification,
-        user_prompt, trace, max_repair_rounds, critique=critique,
+        user_prompt, trace, max_repair_rounds, critique=critique, anon=anon,
     )
 
     return PipelineResult(

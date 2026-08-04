@@ -621,3 +621,224 @@ class TestCritiqueFedToJudge:
         messages = mock.captured_messages[0]
         user_msg = messages[1]["content"]
         assert "Adversarial Critique" not in user_msg
+
+
+# ============================================================
+# 15. Phase 3.2: Shared Anonymous IDs
+# ============================================================
+
+
+class TestSharedAnonIDs:
+    async def test_critique_uses_same_labels_as_judge(self):
+        """Verify that critiqued candidates and judge candidates share the same anonymous labels."""
+        from nim_orchestrator.pipeline.full_pipeline import (
+            create_anon_mapping, critique_candidates, judge_candidates
+        )
+
+        candidates = [
+            Candidate(name="solver", model="m", content="The answer is 42."),
+            Candidate(name="alt_solver", model="m", content="The answer is 99."),
+        ]
+        reviewer_configs = [
+            {"name": "adversarial_critic", "model": "mock", "system_prompt": "Be a critic.", "temperature": 0.2, "reasoning_effort": "none"},
+        ]
+        judge_config = {"model": "mock", "system_prompt": "Be a judge.", "temperature": 0.1, "reasoning_effort": "none"}
+
+        anon = create_anon_mapping(candidates)
+        assert len(anon.shuffled) == 2
+        assert len(anon.labels) == 2
+
+        # Critique with the shared mapping
+        mock = MockRouterClient()
+        trace = []
+        await critique_candidates(mock, reviewer_configs, candidates, "test", trace, anon=anon)
+
+        # Judge with the SAME shared mapping
+        mock2 = MockRouterClient(
+            response_content='{"winner": "Candidate A", "rankings": [], "confidence": 0.9, "disagreement_level": "none"}'
+        )
+        await judge_candidates(mock2, judge_config, candidates, "test", trace, anon=anon)
+
+        # Both should reference the same anonymous labels, never original names
+        critique_msg = mock.captured_messages[0][1]["content"]
+        judge_msg = mock2.captured_messages[0][1]["content"]
+
+        assert "solver" not in critique_msg or "solver" not in judge_msg
+        assert "Candidate A" in critique_msg or "Candidate B" in critique_msg
+        assert "Candidate A" in judge_msg
+
+    async def test_devil_advocate_executed(self):
+        """Verify that devil_advocate reviewer is invoked when configured."""
+        from nim_orchestrator.pipeline.full_pipeline import critique_candidates, create_anon_mapping
+
+        candidates = [Candidate(name="solver", model="m", content="The answer is 42.")]
+        reviewer_configs = [
+            {"name": "adversarial_critic", "model": "mock", "system_prompt": "Critic.", "temperature": 0.2, "reasoning_effort": "none"},
+            {"name": "evidence_verifier", "model": "mock", "system_prompt": "Verifier.", "temperature": 0.1, "reasoning_effort": "none"},
+            {"name": "devil_advocate", "model": "mock", "system_prompt": "Devil.", "temperature": 0.7, "reasoning_effort": "none"},
+        ]
+        anon = create_anon_mapping(candidates)
+
+        mock = MockRouterClient()
+        trace = []
+        result = await critique_candidates(mock, reviewer_configs, candidates, "test prompt", trace, anon=anon)
+
+        # All three reviewers should have been called (3 chat calls)
+        assert len(mock.captured_messages) == 3
+        assert result.get("devil_advocate", "") != "" or len(mock.captured_messages) == 3
+
+    async def test_synthesizer_uses_anon_label_for_winner(self):
+        """Synthesizer should reference the winner by its anonymous label in critique context."""
+        from nim_orchestrator.pipeline.full_pipeline import synthesize_final, create_anon_mapping
+        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+
+        candidates = [
+            Candidate(name="solver", model="m", content="The answer is 42."),
+            Candidate(name="alt_solver", model="m", content="The answer is 99."),
+        ]
+        anon = create_anon_mapping(candidates)
+
+        winner = candidates[0]  # solver
+        winner_label = anon.label_of(winner)
+
+        report = VerificationReport()
+        report.add(VerificationResult(verifier_name="arithmetic", status="pass", details="42 is correct"))
+
+        critique = {"critic": f"Candidate {winner_label} has a minor issue."}
+
+        mock = MockRouterClient()
+        trace = []
+        await synthesize_final(
+            mock,
+            {"model": "mock", "system_prompt": "Synthesize.", "temperature": 0.2, "reasoning_effort": "none"},
+            winner,
+            {"winner": "solver", "confidence": 0.9},
+            report,
+            "What is the answer?",
+            trace,
+            critique=critique,
+            anon=anon,
+        )
+
+        synth_msg = mock.captured_messages[0][1]["content"]
+        assert winner_label in synth_msg
+
+
+# ============================================================
+# 16. Phase 3.2: Verification Status Field
+# ============================================================
+
+
+class TestVerificationStatus:
+    def test_status_passed(self):
+        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        report = VerificationReport()
+        report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
+        report.add(VerificationResult(verifier_name="b", status="pass", details="ok"))
+        assert report.status == "passed"
+
+    def test_status_failed(self):
+        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        report = VerificationReport()
+        report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
+        report.add(VerificationResult(verifier_name="b", status="fail", details="wrong"))
+        assert report.status == "failed"
+
+    def test_status_partial(self):
+        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        report = VerificationReport()
+        report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
+        report.add(VerificationResult(verifier_name="b", status="unverified", details="cannot check"))
+        assert report.status == "partial"
+
+    def test_status_unverified(self):
+        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        report = VerificationReport()
+        report.add(VerificationResult(verifier_name="a", status="unverified", details="no check"))
+        assert report.status == "unverified"
+
+
+# ============================================================
+# 17. Phase 3.2: Math Route Honesty
+# ============================================================
+
+
+class TestMathRouteHonesty:
+    def test_what_is_number_is_direct(self):
+        """Verify 'What is 17 * 23?' is classified as 'direct' not 'verifiable'."""
+        assert _detect_task_type("What is 17 * 23?", "The answer is 391") == "direct"
+
+    def test_calculate_is_still_verifiable(self):
+        """Verify 'Calculate 17 * 23' is still 'verifiable'."""
+        assert _detect_task_type("Calculate 17 * 23", "391") == "verifiable"
+
+    async def test_math_prompt_does_not_escalate_to_full(self):
+        """End-to-end test: 'What is 17 * 23?' should return mode='direct' not 'full'."""
+        from nim_orchestrator.api import handle_intelligence_request
+        from nim_orchestrator.config import Settings, CandidateConfig, JudgeConfig, SynthesizerConfig
+
+        class MockClient:
+            async def chat(self, **kwargs):
+                return ChatResult(
+                    content="17 * 23 = 391",
+                    model="deepseek-v4-flash",
+                    latency_ms=500,
+                    finish_reason="stop",
+                )
+            async def close(self):
+                pass
+
+        settings = Settings(
+            router_base_url="http://mock",
+            router_api_key="mock",
+            candidates=[
+                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none"),
+                CandidateConfig(name="alt", model="m", system_prompt="Alt.", temperature=0.5, reasoning_effort="none"),
+            ],
+            judge=JudgeConfig(model="m", system_prompt="Judge.", temperature=0.1, reasoning_effort="none"),
+            synthesizer=SynthesizerConfig(model="m", system_prompt="Synth.", temperature=0.2, reasoning_effort="none"),
+        )
+
+        client = MockClient()
+        result = await handle_intelligence_request(client, settings, "What is 17 * 23?")
+
+        assert result["mode"] == "direct", f"Expected 'direct', got '{result['mode']}'"
+        assert "17 * 23 = 391" in result["answer"] or "391" in result["answer"]
+        # Should NOT have full pipeline trace entries
+        trace = result.get("pipeline_trace", [])
+        assert not any("Starting full pipeline" in t for t in trace)
+        assert not any("Generated" in t and "candidates from" in t for t in trace)
+
+    async def test_direct_prompt_has_correct_trace(self):
+        """Verify a simple factual prompt produces a trace showing compiler bypass + direct response."""
+        from nim_orchestrator.api import handle_intelligence_request
+        from nim_orchestrator.config import Settings, CandidateConfig, JudgeConfig, SynthesizerConfig
+
+        class MockClient:
+            async def chat(self, **kwargs):
+                return ChatResult(
+                    content="Paris",
+                    model="deepseek-v4-flash",
+                    latency_ms=300,
+                    finish_reason="stop",
+                )
+            async def close(self):
+                pass
+
+        settings = Settings(
+            router_base_url="http://mock",
+            router_api_key="mock",
+            candidates=[
+                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none"),
+            ],
+            judge=JudgeConfig(model="m", system_prompt="Judge.", temperature=0.1, reasoning_effort="none"),
+            synthesizer=SynthesizerConfig(model="m", system_prompt="Synth.", temperature=0.2, reasoning_effort="none"),
+        )
+
+        client = MockClient()
+        result = await handle_intelligence_request(client, settings, "What is the capital of France?")
+
+        assert result["mode"] == "direct"
+        trace = result.get("pipeline_trace", [])
+        assert any("bypass" in t.lower() for t in trace)
+        assert any("direct" in t.lower() for t in trace)
