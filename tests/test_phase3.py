@@ -1,29 +1,27 @@
 """Phase 3 tests: transport gate, task compiler, external verifiers,
 speculative router, clustering, and judge order bias."""
 import os
-import asyncio
 
 import pytest
 
-from nim_orchestrator.transport_gate import transport_gate, TransportGateResult
-from nim_orchestrator.task_compiler import (
-    TaskSpec,
-    Ambiguity,
-    Subtask,
-    _parse_task_spec,
-)
-from nim_orchestrator.verifiers.external_checks import (
-    verify_arithmetic,
-    verify_code_execution_disabled,
-    verify_python_syntax,
-    VerificationResult,
-)
+from nim_orchestrator.clustering import Candidate, cluster_candidates
+from nim_orchestrator.router_client import ChatResult
 from nim_orchestrator.speculative_router import (
     _detect_task_type,
     _has_verification_available,
 )
-from nim_orchestrator.clustering import cluster_candidates, Candidate
-from nim_orchestrator.router_client import ChatResult
+from nim_orchestrator.task_compiler import (
+    Ambiguity,
+    TaskSpec,
+    _parse_task_spec,
+)
+from nim_orchestrator.transport_gate import transport_gate
+from nim_orchestrator.verifiers.external_checks import (
+    VerificationResult,
+    verify_arithmetic,
+    verify_code_execution_disabled,
+    verify_python_syntax,
+)
 
 ROUTER_AVAILABLE = os.environ.get("NIM_ROUTER_AVAILABLE", "0") == "1"
 
@@ -121,7 +119,6 @@ class TestTaskCompiler:
         assert ts.context == "my very long original prompt with details"
 
     def test_ambiguity_ask_high_needs_clarification(self):
-        from nim_orchestrator.task_compiler import TaskCompilerResult
 
         spec = TaskSpec(
             objective="Test",
@@ -343,7 +340,7 @@ class TestJudgeOrderBias:
 
         mock = MockRouterClient()
         trace = []
-        result = await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace)
+        await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace)
 
         assert len(mock.captured_messages) == 1
         messages = mock.captured_messages[0]
@@ -383,25 +380,22 @@ class TestJudgeOrderBias:
 
 class TestThreeStateVerification:
     def test_unverified_is_not_passed(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationResult, VerificationReport
         r = VerificationResult(verifier_name="test", status="unverified", details="cannot check")
         assert r.passed is False
         assert r.failed is False
 
     def test_pass_is_passed(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationResult
         r = VerificationResult(verifier_name="test", status="pass", details="ok")
         assert r.passed is True
         assert r.failed is False
 
     def test_fail_is_failed(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationResult
         r = VerificationResult(verifier_name="test", status="fail", details="broken")
         assert r.passed is False
         assert r.failed is True
 
     def test_report_all_passed_false_when_only_unverified(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="unverified", details="cannot verify"))
         assert report.all_passed is False
@@ -409,7 +403,7 @@ class TestThreeStateVerification:
         assert report.has_unverified is True
 
     def test_report_all_passed_true_when_pass_and_no_failures(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
         assert report.all_passed is True
@@ -417,7 +411,7 @@ class TestThreeStateVerification:
         assert report.has_unverified is False
 
     def test_report_all_passed_false_when_has_failure(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
         report.add(VerificationResult(verifier_name="b", status="fail", details="broken"))
@@ -540,7 +534,6 @@ class TestSolverReviewerSeparation:
             def __init__(self):
                 self.calls = []
             async def chat(self, **kwargs):
-                name = kwargs.get("messages", [{}])[0].get("content", "")[:50]
                 self.calls.append(kwargs)
                 return ChatResult(content="answer", model="mock", latency_ms=1)
             async def close(self):
@@ -549,10 +542,6 @@ class TestSolverReviewerSeparation:
         solver_configs = [
             {"name": "solver", "model": "m", "system_prompt": "be a solver", "temperature": 0.3, "reasoning_effort": "none"},
             {"name": "alternative_solver", "model": "m", "system_prompt": "be different", "temperature": 0.5, "reasoning_effort": "none"},
-        ]
-        reviewer_configs = [
-            {"name": "adversarial_critic", "model": "m", "system_prompt": "be a critic", "temperature": 0.2, "reasoning_effort": "none"},
-            {"name": "evidence_verifier", "model": "m", "system_prompt": "verify evidence", "temperature": 0.1, "reasoning_effort": "none"},
         ]
 
         mock = MockClient()
@@ -632,7 +621,9 @@ class TestSharedAnonIDs:
     async def test_critique_uses_same_labels_as_judge(self):
         """Verify that critiqued candidates and judge candidates share the same anonymous labels."""
         from nim_orchestrator.pipeline.full_pipeline import (
-            create_anon_mapping, critique_candidates, judge_candidates
+            create_anon_mapping,
+            critique_candidates,
+            judge_candidates,
         )
 
         candidates = [
@@ -669,7 +660,7 @@ class TestSharedAnonIDs:
 
     async def test_devil_advocate_executed(self):
         """Verify that devil_advocate reviewer is invoked when configured."""
-        from nim_orchestrator.pipeline.full_pipeline import critique_candidates, create_anon_mapping
+        from nim_orchestrator.pipeline.full_pipeline import create_anon_mapping, critique_candidates
 
         candidates = [Candidate(name="solver", model="m", content="The answer is 42.")]
         reviewer_configs = [
@@ -689,8 +680,8 @@ class TestSharedAnonIDs:
 
     async def test_synthesizer_uses_anon_label_for_winner(self):
         """Synthesizer should reference the winner by its anonymous label in critique context."""
-        from nim_orchestrator.pipeline.full_pipeline import synthesize_final, create_anon_mapping
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.pipeline.full_pipeline import create_anon_mapping, synthesize_final
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
 
         candidates = [
             Candidate(name="solver", model="m", content="The answer is 42."),
@@ -731,28 +722,28 @@ class TestSharedAnonIDs:
 
 class TestVerificationStatus:
     def test_status_passed(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
         report.add(VerificationResult(verifier_name="b", status="pass", details="ok"))
         assert report.status == "passed"
 
     def test_status_failed(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
         report.add(VerificationResult(verifier_name="b", status="fail", details="wrong"))
         assert report.status == "failed"
 
     def test_status_partial(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="pass", details="ok"))
         report.add(VerificationResult(verifier_name="b", status="unverified", details="cannot check"))
         assert report.status == "partial"
 
     def test_status_unverified(self):
-        from nim_orchestrator.verifiers.external_checks import VerificationReport, VerificationResult
+        from nim_orchestrator.verifiers.external_checks import VerificationReport
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="a", status="unverified", details="no check"))
         assert report.status == "unverified"
@@ -775,7 +766,12 @@ class TestMathRouteHonesty:
     async def test_math_prompt_does_not_escalate_to_full(self):
         """End-to-end test: 'What is 17 * 23?' should return mode='direct' not 'full'."""
         from nim_orchestrator.api import handle_intelligence_request
-        from nim_orchestrator.config import Settings, CandidateConfig, JudgeConfig, SynthesizerConfig
+        from nim_orchestrator.config import (
+            CandidateConfig,
+            JudgeConfig,
+            Settings,
+            SynthesizerConfig,
+        )
 
         class MockClient:
             async def chat(self, **kwargs):
@@ -812,7 +808,12 @@ class TestMathRouteHonesty:
     async def test_direct_prompt_has_correct_trace(self):
         """Verify a simple factual prompt produces a trace showing compiler bypass + direct response."""
         from nim_orchestrator.api import handle_intelligence_request
-        from nim_orchestrator.config import Settings, CandidateConfig, JudgeConfig, SynthesizerConfig
+        from nim_orchestrator.config import (
+            CandidateConfig,
+            JudgeConfig,
+            Settings,
+            SynthesizerConfig,
+        )
 
         class MockClient:
             async def chat(self, **kwargs):

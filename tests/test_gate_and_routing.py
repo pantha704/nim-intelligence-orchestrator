@@ -1,8 +1,8 @@
 """Tests for input_gate, speculative_router, and streaming."""
-import asyncio
 import pytest
-from nim_orchestrator.input_gate import gate_prompt, GateAction, sanitize_prompt, _looks_like_garbage, _has_meaningful_words
-from nim_orchestrator.clustering import cluster_candidates, Candidate, _answers_match
+
+from nim_orchestrator.clustering import Candidate, _answers_match, cluster_candidates
+from nim_orchestrator.input_gate import GateAction, _looks_like_garbage, gate_prompt
 
 
 class TestInputGate:

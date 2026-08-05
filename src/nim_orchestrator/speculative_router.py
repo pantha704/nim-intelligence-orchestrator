@@ -25,7 +25,6 @@ class SpeculativeResult:
 def _detect_task_type(prompt: str, answer: str) -> str:
     """Classify the task type from the prompt and answer."""
     prompt_lower = prompt.lower()
-    answer_lower = answer.lower()
 
     if re.search(r"\b(?:write|implement|code|function|class|program|script)\b", prompt_lower):
         if "```" in answer or "def " in answer or "function " in answer:
