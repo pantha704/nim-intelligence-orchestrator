@@ -13,6 +13,7 @@ class CandidateConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.3
     reasoning_effort: str = "medium"
+    role: str = "solver"
 
 
 class JudgeConfig(BaseModel):
@@ -20,6 +21,7 @@ class JudgeConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.1
     reasoning_effort: str = "high"
+    role: str = "judge"
 
 
 class SynthesizerConfig(BaseModel):
@@ -27,6 +29,7 @@ class SynthesizerConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.2
     reasoning_effort: str = "high"
+    role: str = "synthesizer"
 
 
 class TaskCompilerConfig(BaseModel):

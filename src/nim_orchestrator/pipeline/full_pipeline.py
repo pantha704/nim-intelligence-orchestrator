@@ -1,10 +1,12 @@
 import asyncio
 import json
-import random
 import time
 from dataclasses import dataclass, field
 
+from ..agents import AgentRole
 from ..clustering import Candidate, ClusteringResult, cluster_candidates
+from ..context import AnonMapping
+from ..context import create_anon_mapping as _create_anon_mapping
 from ..router_client import RouterClient
 from ..verifiers.external_checks import VerificationReport, verify_answer
 
@@ -96,38 +98,31 @@ async def generate_candidates(
     return results
 
 
-@dataclass
-class AnonMapping:
-    """Shared anonymization mapping used by reviewers, judge, and synthesizer."""
-    label_to_original: dict[str, str] = field(default_factory=dict)
-    original_to_label: dict[str, str] = field(default_factory=dict)
-    shuffled: list[Candidate] = field(default_factory=list)
-    labels: list[str] = field(default_factory=list)
-
-    def label_of(self, candidate: Candidate) -> str:
-        return self.original_to_label.get(candidate.name, candidate.name)
-
-    def original_of(self, label: str) -> str:
-        return self.label_to_original.get(label, label)
-
-    def anon_text(self, max_chars: int = 2000) -> str:
-        return "\n\n".join(
-            f"--- {label} ---\n{c.content[:max_chars]}"
-            for label, c in zip(self.labels, self.shuffled)
-        )
-
-
 def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
-    """Create a shared shuffle + anonymous label mapping for the pipeline."""
-    valid = [c for c in candidates if not c.error and c.content]
-    shuffled = list(valid)
-    random.shuffle(shuffled)
-    labels = [f"Candidate {chr(ord('A') + i)}" for i in range(len(shuffled))]
-    mapping = AnonMapping(shuffled=shuffled, labels=labels)
-    for label, cand in zip(labels, shuffled):
-        mapping.label_to_original[label] = cand.name
-        mapping.original_to_label[cand.name] = label
-    return mapping
+    """Create anonymized mapping. Delegates to context.create_anon_mapping.
+
+    Returns a context.AnonMapping (which has the update_candidates method
+    needed for persistent IDs through debate).
+    """
+    return _create_anon_mapping(candidates)
+
+
+def _infer_role_from_name(name: str) -> AgentRole:
+    """Temporary fallback: infer role from name during migration.
+    
+    This exists only for backward compatibility with configs that don't
+    yet have an explicit `role` field. New code should always set `role`.
+    """
+    name_lower = name.lower()
+    if "critic" in name_lower:
+        return AgentRole.CRITIC
+    if "evidence" in name_lower or "verifier" in name_lower:
+        return AgentRole.EVIDENCE_VERIFIER
+    if "devil" in name_lower:
+        return AgentRole.DEVILS_ADVOCATE
+    if "alternative" in name_lower or "alt" in name_lower:
+        return AgentRole.ALTERNATIVE_SOLVER
+    return AgentRole.SOLVER
 
 
 async def critique_candidates(
@@ -152,18 +147,27 @@ async def critique_candidates(
 
     candidate_text = anon.anon_text(2000)
 
+    # Use explicit AgentRole — no name-based detection
     critic_config = None
     evidence_config = None
     devil_config = None
     for cfg in reviewer_configs:
-        name_lower = cfg.get("name", "").lower()
-        role = cfg.get("role", "").lower()
-        if "critic" in name_lower or "critic" in role:
-            if critic_config is None:
-                critic_config = cfg
-        if ("evidence" in name_lower or "verifier" in name_lower) and evidence_config is None:
+        role_str = cfg.get("role", "")
+        if isinstance(role_str, AgentRole):
+            role = role_str
+        elif role_str:
+            try:
+                role = AgentRole(role_str)
+            except ValueError:
+                role = _infer_role_from_name(cfg.get("name", ""))
+        else:
+            role = _infer_role_from_name(cfg.get("name", ""))
+
+        if role == AgentRole.CRITIC and critic_config is None:
+            critic_config = cfg
+        elif role == AgentRole.EVIDENCE_VERIFIER and evidence_config is None:
             evidence_config = cfg
-        if ("devil" in name_lower or "devil" in role) and devil_config is None:
+        elif role == AgentRole.DEVILS_ADVOCATE and devil_config is None:
             devil_config = cfg
 
     results = {}
@@ -569,17 +573,25 @@ async def run_full_pipeline(
     t0 = time.monotonic()
     trace: list[str] = []
 
-    # Separate solver candidates from reviewer candidates
+    # Separate solver candidates from reviewer candidates using AgentRole
     solver_configs = []
     reviewer_configs = []
     for cfg in candidates_config:
-        role = cfg.get("role", cfg.get("name", "")).lower()
-        name_lower = cfg.get("name", "").lower()
-        is_reviewer = any(k in role or k in name_lower for k in ("critic", "evidence", "verifier", "devil"))
-        if is_reviewer:
-            reviewer_configs.append(cfg)
+        role_str = cfg.get("role", "")
+        if isinstance(role_str, AgentRole):
+            role = role_str
+        elif role_str:
+            try:
+                role = AgentRole(role_str)
+            except ValueError:
+                role = _infer_role_from_name(cfg.get("name", ""))
         else:
+            role = _infer_role_from_name(cfg.get("name", ""))
+
+        if role.is_solver:
             solver_configs.append(cfg)
+        elif role.is_reviewer:
+            reviewer_configs.append(cfg)
 
     if not solver_configs:
         solver_configs = candidates_config
@@ -610,8 +622,9 @@ async def run_full_pipeline(
             client, clustering_result, solver_configs, candidates,
             user_prompt, debate_rounds, trace,
         )
-        # Re-anonymize after debate since candidates may have changed
-        anon = create_anon_mapping(candidates)
+        # Persistent anon IDs: update candidates in-place, do NOT re-create mapping.
+        # Labels are preserved — Candidate A is still Candidate A after debate.
+        anon.update_candidates(candidates)
         clustering_result = cluster_candidates(candidates)
         trace.append(f"Post-debate clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
 

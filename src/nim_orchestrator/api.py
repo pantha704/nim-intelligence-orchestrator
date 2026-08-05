@@ -1,12 +1,10 @@
-import asyncio
 from pathlib import Path
-from typing import Optional
 
-from .config import Settings, load_settings
-from .router_client import RouterClient, StreamConfig
-from .speculative_router import SpeculativeResult, speculative_route
-from .task_compiler import TaskCompilerResult, TaskSpec, compile_task
-from .transport_gate import TransportGateResult, transport_gate
+from .config import Settings
+from .policy import PolicyEngine
+from .router_client import RouterClient
+from .task_compiler import TaskSpec, compile_task
+from .transport_gate import transport_gate
 
 
 async def handle_intelligence_request(
@@ -15,7 +13,7 @@ async def handle_intelligence_request(
     raw_prompt: str,
     force_mode: str | None = None,
 ) -> dict:
-    """Main entry point. Pipeline: transport gate → task compiler → route → pipeline."""
+    """Main entry point. Pipeline: transport gate → task compiler → policy engine → pipeline."""
 
     # --- Stage 0: Transport gate (minimal — size, encoding, emptiness only) ---
     gate = transport_gate(raw_prompt)
@@ -45,7 +43,7 @@ async def handle_intelligence_request(
         }
 
     # --- Stage 1: Task Compiler (with bypass for obvious simple queries) ---
-    from .task_compiler import should_bypass_compiler, bypass_task_spec
+    from .task_compiler import bypass_task_spec, should_bypass_compiler
 
     if should_bypass_compiler(prompt):
         task_result = bypass_task_spec(prompt)
@@ -79,14 +77,19 @@ async def handle_intelligence_request(
     if task_spec.assumptions:
         trace.append(f"Assumptions: {'; '.join(task_spec.assumptions[:3])}")
 
+    # --- Stage 2: Central Policy Engine — single routing decision ---
+    engine = PolicyEngine(settings)
+    policy = engine.decide(prompt, task_spec=task_spec, force_mode=force_mode)
+
+    trace.append(f"Policy: route={policy.route}, reason={policy.reason}")
+
     if force_mode == "full":
-        return await _run_full(client, settings, prompt, task_spec, trace)
+        return await _run_full(client, settings, prompt, task_spec, trace, policy)
 
-    # --- Stage 2: Route based on TaskSpec ---
-    route = task_spec.recommended_route
+    # --- Stage 3: Execute based on policy ---
+    if policy.should_speculate and policy.route == "direct":
+        from .speculative_router import speculative_route
 
-    if route == "direct":
-        # Simple factual — try a quick direct response
         spec = await speculative_route(
             client, model="deepseek-v4-flash", prompt=prompt, max_quick_tokens=256,
         )
@@ -101,22 +104,14 @@ async def handle_intelligence_request(
                 "latency_ms": round(spec.quick_result.latency_ms, 1) if spec.quick_result else 0,
             }
         # Fall through to full pipeline if speculative says escalate
-        return await _run_full(client, settings, prompt, task_spec, trace)
+        return await _run_full(client, settings, prompt, task_spec, trace, policy)
 
-    if route == "verifiable":
-        trace.append("Verifiable task — running full pipeline with verification")
-        return await _run_full(client, settings, prompt, task_spec, trace)
-
-    if route == "complex":
-        trace.append("Complex task — running full pipeline")
-        return await _run_full(client, settings, prompt, task_spec, trace)
-
-    if route == "open_ended":
-        trace.append("Open-ended task — running full pipeline")
-        return await _run_full(client, settings, prompt, task_spec, trace)
+    if policy.should_run_full_pipeline:
+        trace.append(f"Full pipeline — {policy.route}")
+        return await _run_full(client, settings, prompt, task_spec, trace, policy)
 
     # Default: full pipeline
-    return await _run_full(client, settings, prompt, task_spec, trace)
+    return await _run_full(client, settings, prompt, task_spec, trace, policy)
 
 
 async def _run_full(
@@ -125,31 +120,58 @@ async def _run_full(
     prompt: str,
     task_spec: TaskSpec,
     trace: list[str],
+    policy=None,
 ) -> dict:
     from .pipeline.full_pipeline import run_full_pipeline
 
-    candidates_config = [
-        {
-            "name": c.name,
-            "model": c.model,
-            "system_prompt": c.system_prompt,
-            "temperature": c.temperature,
-            "reasoning_effort": c.reasoning_effort,
+    if policy is not None:
+        # Use agent configs from the PolicyEngine decision
+        candidates_config = [
+            cfg.to_dict() for cfg in (policy.solver_configs + policy.reviewer_configs)
+        ]
+        judge_config = policy.judge_config.to_dict() if policy.judge_config else {
+            "model": settings.judge.model,
+            "system_prompt": settings.judge.system_prompt,
+            "temperature": settings.judge.temperature,
+            "reasoning_effort": settings.judge.reasoning_effort,
         }
-        for c in settings.candidates
-    ]
-    judge_config = {
-        "model": settings.judge.model,
-        "system_prompt": settings.judge.system_prompt,
-        "temperature": settings.judge.temperature,
-        "reasoning_effort": settings.judge.reasoning_effort,
-    }
-    synth_config = {
-        "model": settings.synthesizer.model,
-        "system_prompt": settings.synthesizer.system_prompt,
-        "temperature": settings.synthesizer.temperature,
-        "reasoning_effort": settings.synthesizer.reasoning_effort,
-    }
+        synth_config = policy.synthesizer_config.to_dict() if policy.synthesizer_config else {
+            "model": settings.synthesizer.model,
+            "system_prompt": settings.synthesizer.system_prompt,
+            "temperature": settings.synthesizer.temperature,
+            "reasoning_effort": settings.synthesizer.reasoning_effort,
+        }
+        debate_rounds = policy.debate_rounds
+        max_repair = policy.max_repair_rounds
+        verif_timeout = policy.verification_timeout
+    else:
+        # Fallback: build from settings directly
+        candidates_config = [
+            {
+                "name": c.name,
+                "model": c.model,
+                "system_prompt": c.system_prompt,
+                "temperature": c.temperature,
+                "reasoning_effort": c.reasoning_effort,
+                "role": c.role,
+            }
+            for c in settings.candidates
+        ]
+        judge_config = {
+            "model": settings.judge.model,
+            "system_prompt": settings.judge.system_prompt,
+            "temperature": settings.judge.temperature,
+            "reasoning_effort": settings.judge.reasoning_effort,
+        }
+        synth_config = {
+            "model": settings.synthesizer.model,
+            "system_prompt": settings.synthesizer.system_prompt,
+            "temperature": settings.synthesizer.temperature,
+            "reasoning_effort": settings.synthesizer.reasoning_effort,
+        }
+        debate_rounds = settings.debate_rounds
+        max_repair = settings.max_repair_rounds
+        verif_timeout = settings.verifier_timeout
 
     result = await run_full_pipeline(
         client,
@@ -157,9 +179,9 @@ async def _run_full(
         candidates_config,
         judge_config,
         synth_config,
-        debate_rounds=settings.debate_rounds,
-        max_repair_rounds=settings.max_repair_rounds,
-        verification_timeout=settings.verifier_timeout,
+        debate_rounds=debate_rounds,
+        max_repair_rounds=max_repair,
+        verification_timeout=verif_timeout,
     )
 
     trace.extend(result.pipeline_trace)
@@ -205,6 +227,7 @@ async def run_benchmark(settings: Settings) -> dict:
             "system_prompt": c.system_prompt,
             "temperature": c.temperature,
             "reasoning_effort": c.reasoning_effort,
+            "role": c.role,
         }
         for c in settings.candidates
     ]
