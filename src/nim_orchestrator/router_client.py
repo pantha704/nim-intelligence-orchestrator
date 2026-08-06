@@ -55,6 +55,54 @@ MAX_RETRIES = 3
 RETRYABLE_STATUS = {429, 529, 502, 503}
 
 
+class BudgetExhaustedError(Exception):
+    """Raised when the execution budget prevents another model call."""
+
+
+async def budgeted_chat(
+    client: "RouterClient",
+    ctx,
+    agent_name: str,
+    model: str,
+    messages: list[dict],
+    temperature: float = 0.3,
+    reasoning_effort: str = "none",
+    max_tokens: int = 1024,
+    timeout: float = 30,
+):
+    """Chat call under ExecutionBudget enforcement.
+
+    - checks can_call() before calling (atomic under the concurrency semaphore)
+    - records each spawned agent
+    - enforces max_concurrent_agents via the budget semaphore
+    - records every call and latency
+    - raises BudgetExhaustedError when the budget is spent
+    """
+    async with ctx.budget.semaphore:
+        if not ctx.budget.can_call():
+            raise BudgetExhaustedError(
+                f"budget exhausted at {ctx.budget.model_calls}/{ctx.budget.limits.max_model_calls} "
+                f"calls, {ctx.budget.elapsed_seconds:.1f}s elapsed"
+            )
+        if not ctx.budget.can_spawn_agent():
+            raise BudgetExhaustedError(
+                f"agent budget exhausted — max {ctx.budget.limits.max_total_agents} agents reached"
+            )
+        ctx.budget.record_agent()
+        result = await asyncio.wait_for(
+            client.chat(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
+            ),
+            timeout=timeout,
+        )
+        ctx.budget.record_call(agent_name, model, result.latency_ms, result.tokens_generated)
+        return result
+
+
 class RouterClient:
     def __init__(self, base_url: str, api_key: str, timeout: float = 60):
         self.base_url = base_url.rstrip("/")

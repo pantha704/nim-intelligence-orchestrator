@@ -3,7 +3,6 @@ import time
 from dataclasses import dataclass, field
 
 from ..clustering import Candidate, cluster_candidates
-from ..pipeline.full_pipeline import run_full_pipeline
 from ..router_client import RouterClient
 
 
@@ -90,6 +89,8 @@ async def run_mode_best_of_5(
 async def run_mode_best_of_5_judge(
     client: RouterClient, candidates_config: list[dict], judge_config: dict, prompt: str
 ) -> dict:
+    from ..agents import AgentConfig, AgentRole
+    from ..context import PolicyResult, RunContext, create_anon_mapping
     from ..pipeline.full_pipeline import judge_candidates
 
     t0 = time.monotonic()
@@ -111,7 +112,20 @@ async def run_mode_best_of_5_judge(
             return Candidate(name=cfg["name"], model=cfg["model"], content="", error=str(e)[:200])
 
     candidates = list(await asyncio.gather(*[_gen(c) for c in candidates_config]))
-    judge_result = await judge_candidates(client, judge_config, candidates, prompt, [])
+
+    ctx = RunContext(raw_prompt=prompt)
+    ctx.candidates = candidates
+    ctx.anon = create_anon_mapping(candidates)
+    ctx.policy = PolicyResult(judge_config=AgentConfig(
+        name="judge",
+        role=AgentRole.JUDGE,
+        model=judge_config["model"],
+        system_prompt=judge_config["system_prompt"],
+        temperature=judge_config.get("temperature", 0.1),
+        reasoning_effort=judge_config.get("reasoning_effort", "none"),
+    ))
+
+    judge_result = await judge_candidates(client, ctx)
 
     winner_name = judge_result.get("winner", "")
     winner = next((c for c in candidates if c.name == winner_name and not c.error), None)
@@ -138,7 +152,9 @@ async def run_mode_full(
     debate_rounds: int = 2,
     max_repair_rounds: int = 2,
 ) -> dict:
-    result = await run_full_pipeline(
+    from ..pipeline.full_pipeline import run_full_pipeline_legacy
+
+    result = await run_full_pipeline_legacy(
         client,
         prompt,
         candidates_config,

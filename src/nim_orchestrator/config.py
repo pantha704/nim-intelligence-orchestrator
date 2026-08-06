@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -13,7 +14,7 @@ class CandidateConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.3
     reasoning_effort: str = "medium"
-    role: str = "solver"
+    role: Literal["solver", "alternative_solver", "critic", "evidence_verifier", "devils_advocate"]
 
 
 class JudgeConfig(BaseModel):
@@ -21,7 +22,7 @@ class JudgeConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.1
     reasoning_effort: str = "high"
-    role: str = "judge"
+    role: Literal["judge"] = "judge"
 
 
 class SynthesizerConfig(BaseModel):
@@ -29,7 +30,7 @@ class SynthesizerConfig(BaseModel):
     system_prompt: str
     temperature: float = 0.2
     reasoning_effort: str = "high"
-    role: str = "synthesizer"
+    role: Literal["synthesizer"] = "synthesizer"
 
 
 class TaskCompilerConfig(BaseModel):

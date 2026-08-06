@@ -1,3 +1,9 @@
+"""Full pipeline: solvers → critique → debate → judge → verification → synthesis.
+
+All execution state lives in and is mutated on the RunContext. Every model
+call goes through budgeted_chat, which enforces the ExecutionBudget
+(calls, time, concurrency, agent count).
+"""
 import asyncio
 import json
 import time
@@ -5,9 +11,9 @@ from dataclasses import dataclass, field
 
 from ..agents import AgentRole
 from ..clustering import Candidate, ClusteringResult, cluster_candidates
-from ..context import AnonMapping
+from ..context import AnonMapping, RunContext
 from ..context import create_anon_mapping as _create_anon_mapping
-from ..router_client import RouterClient
+from ..router_client import BudgetExhaustedError, RouterClient, budgeted_chat
 from ..verifiers.external_checks import VerificationReport, verify_answer
 
 
@@ -49,125 +55,82 @@ class PipelineResult:
         }
 
 
-async def generate_candidates(
-    client: RouterClient,
-    candidates_config: list[dict],
-    user_prompt: str,
-    trace: list[str],
-) -> list[Candidate]:
+def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
+    """Create anonymized mapping. Delegates to context.create_anon_mapping."""
+    return _create_anon_mapping(candidates)
+
+
+async def generate_candidates(client: RouterClient, ctx: RunContext) -> list[Candidate]:
+    """Generate solver candidates. Each solver call is budget-enforced."""
+    solver_configs = ctx.policy.solver_configs
+    user_prompt = ctx.raw_prompt
 
     async def _gen(cfg):
         messages = [
-            {"role": "system", "content": cfg["system_prompt"]},
+            {"role": "system", "content": cfg.system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         try:
-            result = await asyncio.wait_for(
-                client.chat(
-                    model=cfg["model"],
-                    messages=messages,
-                    temperature=cfg.get("temperature", 0.3),
-                    reasoning_effort=cfg.get("reasoning_effort", "none"),
-                    max_tokens=1024,
-                ),
-                timeout=30,
+            result = await budgeted_chat(
+                client,
+                ctx,
+                agent_name=cfg.name,
+                model=cfg.model,
+                messages=messages,
+                temperature=cfg.temperature,
+                reasoning_effort=cfg.reasoning_effort,
+                max_tokens=cfg.max_tokens,
+                timeout=cfg.timeout_seconds,
             )
             return Candidate(
-                name=cfg["name"],
-                model=cfg["model"],
+                name=cfg.name,
+                model=cfg.model,
                 content=result.content,
                 reasoning=result.reasoning,
                 latency_ms=result.latency_ms,
             )
+        except BudgetExhaustedError as e:
+            return Candidate(name=cfg.name, model=cfg.model, content="", error=str(e)[:300])
         except Exception as e:
-            return Candidate(
-                name=cfg["name"],
-                model=cfg["model"],
-                content="",
-                error=str(e)[:300],
-            )
+            return Candidate(name=cfg.name, model=cfg.model, content="", error=str(e)[:300])
 
-    tasks = [_gen(cfg) for cfg in candidates_config]
+    tasks = [_gen(cfg) for cfg in solver_configs]
     results = await asyncio.gather(*tasks)
 
-    trace.append(f"Generated {len(results)} candidates from {len(candidates_config)} agents")
+    ctx.add_trace(f"Generated {len(results)} candidates from {len(solver_configs)} agents")
     for c in results:
         status = "OK" if not c.error else f"ERROR: {c.error[:80]}"
-        trace.append(f"  {c.name} ({c.model}): {status} [{c.latency_ms:.0f}ms]")
+        ctx.add_trace(f"  {c.name} ({c.model}): {status} [{c.latency_ms:.0f}ms]")
 
+    ctx.candidates = results
     return results
 
 
-def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
-    """Create anonymized mapping. Delegates to context.create_anon_mapping.
-
-    Returns a context.AnonMapping (which has the update_candidates method
-    needed for persistent IDs through debate).
-    """
-    return _create_anon_mapping(candidates)
-
-
-def _infer_role_from_name(name: str) -> AgentRole:
-    """Temporary fallback: infer role from name during migration.
-    
-    This exists only for backward compatibility with configs that don't
-    yet have an explicit `role` field. New code should always set `role`.
-    """
-    name_lower = name.lower()
-    if "critic" in name_lower:
-        return AgentRole.CRITIC
-    if "evidence" in name_lower or "verifier" in name_lower:
-        return AgentRole.EVIDENCE_VERIFIER
-    if "devil" in name_lower:
-        return AgentRole.DEVILS_ADVOCATE
-    if "alternative" in name_lower or "alt" in name_lower:
-        return AgentRole.ALTERNATIVE_SOLVER
-    return AgentRole.SOLVER
-
-
-async def critique_candidates(
-    client: RouterClient,
-    reviewer_configs: list[dict],
-    candidates: list[Candidate],
-    user_prompt: str,
-    trace: list[str],
-    anon: AnonMapping | None = None,
-) -> dict:
+async def critique_candidates(client: RouterClient, ctx: RunContext) -> dict:
     """Run adversarial critic, evidence verifier, and devil's advocate.
 
-    Reviewers see candidates under the same anonymous IDs used by the judge,
-    so their critiques can reference candidates the judge will recognize.
+    Reviewers are assigned by explicit AgentRole from the policy — never
+    inferred from names.
     """
+    anon = ctx.anon or create_anon_mapping(ctx.candidates)
+    ctx.anon = anon
 
-    if not anon:
-        anon = create_anon_mapping(candidates)
     if not anon.shuffled:
-        trace.append("Critique: no valid candidates to critique")
-        return {"critic": "", "evidence_verifier": "", "devil_advocate": ""}
+        ctx.add_trace("Critique: no valid candidates to critique")
+        ctx.critique = {}
+        return {}
 
     candidate_text = anon.anon_text(2000)
 
-    # Use explicit AgentRole — no name-based detection
     critic_config = None
     evidence_config = None
     devil_config = None
-    for cfg in reviewer_configs:
-        role_str = cfg.get("role", "")
-        if isinstance(role_str, AgentRole):
-            role = role_str
-        elif role_str:
-            try:
-                role = AgentRole(role_str)
-            except ValueError:
-                role = _infer_role_from_name(cfg.get("name", ""))
-        else:
-            role = _infer_role_from_name(cfg.get("name", ""))
-
-        if role == AgentRole.CRITIC and critic_config is None:
+    for cfg in ctx.policy.reviewer_configs:
+        if cfg.role == AgentRole.CRITIC and critic_config is None:
             critic_config = cfg
-        elif role == AgentRole.EVIDENCE_VERIFIER and evidence_config is None:
+        elif cfg.role == AgentRole.EVIDENCE_VERIFIER and evidence_config is None:
             evidence_config = cfg
-        elif role == AgentRole.DEVILS_ADVOCATE and devil_config is None:
+        elif cfg.role == AgentRole.DEVILS_ADVOCATE and devil_config is None:
             devil_config = cfg
 
     results = {}
@@ -176,8 +139,8 @@ async def critique_candidates(
         if not config:
             return key, ""
         messages = [
-            {"role": "system", "content": config["system_prompt"]},
-            {"role": "user", "content": f"""Original problem: {user_prompt}
+            {"role": "system", "content": config.system_prompt},
+            {"role": "user", "content": f"""Original problem: {ctx.raw_prompt}
 
 Candidate answers:
 {candidate_text}
@@ -185,19 +148,23 @@ Candidate answers:
 {instruction}"""},
         ]
         try:
-            result = await asyncio.wait_for(
-                client.chat(
-                    model=config["model"],
-                    messages=messages,
-                    temperature=config.get("temperature", 0.3),
-                    reasoning_effort=config.get("reasoning_effort", "none"),
-                    max_tokens=1024,
-                ),
-                timeout=30,
+            result = await budgeted_chat(
+                client,
+                ctx,
+                agent_name=key,
+                model=config.model,
+                messages=messages,
+                temperature=config.temperature,
+                reasoning_effort=config.reasoning_effort,
+                max_tokens=config.max_tokens,
+                timeout=config.timeout_seconds,
             )
             return key, result.content
+        except BudgetExhaustedError as e:
+            ctx.add_trace(f"{key} skipped: {e}")
+            return key, ""
         except Exception as e:
-            trace.append(f"{key} error: {str(e)[:100]}")
+            ctx.add_trace(f"{key} error: {str(e)[:100]}")
             return key, ""
 
     tasks = [
@@ -218,34 +185,28 @@ Candidate answers:
         results[key] = content
 
     active = [k for k in ("critic", "evidence_verifier", "devil_advocate") if results.get(k)]
-    trace.append(f"Critique done: {', '.join(active) if active else 'none'}")
+    ctx.add_trace(f"Critique done: {', '.join(active) if active else 'none'}")
+    ctx.critique = results
     return results
 
 
-async def debate_disagreeing_candidates(
-    client: RouterClient,
-    clusters: ClusteringResult,
-    candidate_configs: list[dict],
-    candidates: list[Candidate],
-    user_prompt: str,
-    debate_rounds: int,
-    trace: list[str],
-) -> list[Candidate]:
+async def debate_disagreeing_candidates(client: RouterClient, ctx: RunContext) -> list[Candidate]:
+    if ctx.clustering is None or ctx.clustering.disagreement_level != "high":
+        ctx.add_trace(
+            f"Disagreement level: {ctx.clustering.disagreement_level if ctx.clustering else 'none'} — skipping debate"
+        )
+        return ctx.candidates
 
-    if clusters.disagreement_level != "high":
-        trace.append(f"Disagreement level: {clusters.disagreement_level} — skipping debate")
-        return candidates
+    if ctx.policy.debate_rounds < 1:
+        return ctx.candidates
 
-    if debate_rounds < 1:
-        return candidates
-
-    sorted_clusters = sorted(clusters.clusters, key=lambda c: len(c), reverse=True)
+    sorted_clusters = sorted(ctx.clustering.clusters, key=lambda c: len(c), reverse=True)
     top_clusters = sorted_clusters[:3]
 
-    updated = list(candidates)
+    updated = list(ctx.candidates)
 
-    for round_num in range(debate_rounds):
-        trace.append(f"Debate round {round_num + 1}")
+    for round_num in range(ctx.policy.debate_rounds):
+        ctx.add_trace(f"Debate round {round_num + 1}")
 
         async def _debate_one(cluster):
             rep = cluster[0]
@@ -254,7 +215,7 @@ async def debate_disagreeing_candidates(
                 for c in top_clusters if c[0].name != rep.name
             )
 
-            debate_prompt = f"""Original problem: {user_prompt}
+            debate_prompt = f"""Original problem: {ctx.raw_prompt}
 
 Your current answer:
 {rep.content[:1000]}
@@ -272,14 +233,15 @@ Revised answer (show reasoning):"""
             ]
 
             try:
-                result = await asyncio.wait_for(
-                    client.chat(
-                        model=rep.model,
-                        messages=messages,
-                        temperature=0.3,
-                        reasoning_effort="none",
-                        max_tokens=1024,
-                    ),
+                result = await budgeted_chat(
+                    client,
+                    ctx,
+                    agent_name=f"debate:{rep.name}",
+                    model=rep.model,
+                    messages=messages,
+                    temperature=0.3,
+                    reasoning_effort="none",
+                    max_tokens=1024,
                     timeout=30,
                 )
                 return rep.name, Candidate(
@@ -289,8 +251,11 @@ Revised answer (show reasoning):"""
                     reasoning=result.reasoning,
                     latency_ms=result.latency_ms,
                 )
+            except BudgetExhaustedError as e:
+                ctx.add_trace(f"  {rep.name} debate skipped: {e}")
+                return rep.name, None
             except Exception as e:
-                trace.append(f"  {rep.name} debate error: {str(e)[:100]}")
+                ctx.add_trace(f"  {rep.name} debate error: {str(e)[:100]}")
                 return rep.name, None
 
         results = await asyncio.gather(*[_debate_one(c) for c in top_clusters])
@@ -335,38 +300,34 @@ def _extract_json_from_response(content: str) -> dict | None:
     return None
 
 
-async def judge_candidates(
-    client: RouterClient,
-    judge_config: dict,
-    candidates: list[Candidate],
-    user_prompt: str,
-    trace: list[str],
-    critique: dict | None = None,
-    anon: AnonMapping | None = None,
-) -> dict:
-
-    if not anon:
-        anon = create_anon_mapping(candidates)
+async def judge_candidates(client: RouterClient, ctx: RunContext) -> dict:
+    anon = ctx.anon or create_anon_mapping(ctx.candidates)
+    ctx.anon = anon
 
     if len(anon.shuffled) <= 1:
-        trace.append("Only 1 valid candidate — judge not needed")
+        ctx.add_trace("Only 1 valid candidate — judge not needed")
         winner_name = anon.shuffled[0].name if anon.shuffled else ""
         return {"winner": winner_name, "rankings": [], "confidence": 1.0, "disagreement_level": "none"}
+
+    judge_config = ctx.policy.judge_config
+    if judge_config is None:
+        ctx.add_trace("No judge configured — using first candidate")
+        return {"winner": anon.shuffled[0].name, "rankings": [], "confidence": 0.5, "disagreement_level": "none"}
 
     candidate_summaries = anon.anon_text(2000)
 
     critique_section = ""
-    if critique and (critique.get("critic") or critique.get("evidence_verifier") or critique.get("devil_advocate")):
+    if ctx.critique and (ctx.critique.get("critic") or ctx.critique.get("evidence_verifier") or ctx.critique.get("devil_advocate")):
         critique_section = "\n\n--- Adversarial Critique ---\n"
-        if critique.get("critic"):
-            critique_section += f"Critic findings:\n{critique['critic'][:1000]}\n"
-        if critique.get("evidence_verifier"):
-            critique_section += f"Evidence verification:\n{critique['evidence_verifier'][:1000]}\n"
-        if critique.get("devil_advocate"):
-            critique_section += f"Devil's advocate counterargument:\n{critique['devil_advocate'][:1000]}\n"
+        if ctx.critique.get("critic"):
+            critique_section += f"Critic findings:\n{ctx.critique['critic'][:1000]}\n"
+        if ctx.critique.get("evidence_verifier"):
+            critique_section += f"Evidence verification:\n{ctx.critique['evidence_verifier'][:1000]}\n"
+        if ctx.critique.get("devil_advocate"):
+            critique_section += f"Devil's advocate counterargument:\n{ctx.critique['devil_advocate'][:1000]}\n"
         critique_section += "\nConsider these critiques when evaluating candidates."
 
-    judge_prompt = f"""Problem: {user_prompt}
+    judge_prompt = f"""Problem: {ctx.raw_prompt}
 
 Here are {len(anon.shuffled)} candidate solutions:
 
@@ -381,26 +342,27 @@ Refer to candidates by their anonymous labels (Candidate A, Candidate B, etc.).
 Respond ONLY with valid JSON."""
 
     messages = [
-        {"role": "system", "content": judge_config["system_prompt"]},
+        {"role": "system", "content": judge_config.system_prompt},
         {"role": "user", "content": judge_prompt},
     ]
 
     try:
-        result = await asyncio.wait_for(
-            client.chat(
-                model=judge_config["model"],
-                messages=messages,
-                temperature=judge_config.get("temperature", 0.1),
-                reasoning_effort=judge_config.get("reasoning_effort", "none"),
-                max_tokens=1024,
-            ),
-            timeout=30,
+        result = await budgeted_chat(
+            client,
+            ctx,
+            agent_name="judge",
+            model=judge_config.model,
+            messages=messages,
+            temperature=judge_config.temperature,
+            reasoning_effort=judge_config.reasoning_effort,
+            max_tokens=judge_config.max_tokens,
+            timeout=judge_config.timeout_seconds,
         )
 
         parsed = _extract_json_from_response(result.content)
         if parsed is None:
             parsed = {"winner": anon.labels[0], "rankings": [], "confidence": 0.5,
-                     "disagreement_level": "unknown", "raw": result.content[:500]}
+                      "disagreement_level": "unknown", "raw": result.content[:500]}
 
         winner_label = parsed.get("winner", "")
         parsed["winner"] = anon.original_of(winner_label)
@@ -411,28 +373,27 @@ Respond ONLY with valid JSON."""
                 for r in parsed["rankings"]
             ]
 
-        trace.append(f"Judge: winner={parsed.get('winner', '?')}, confidence={parsed.get('confidence', '?')}")
+        ctx.add_trace(f"Judge: winner={parsed.get('winner', '?')}, confidence={parsed.get('confidence', '?')}")
         return parsed
 
+    except BudgetExhaustedError as e:
+        ctx.add_trace(f"Judge skipped: {e}")
+        fallback_winner = anon.shuffled[0].name if anon.shuffled else ""
+        return {"winner": fallback_winner, "rankings": [], "confidence": 0.0, "disagreement_level": "budget_exhausted"}
     except Exception as e:
-        trace.append(f"Judge error: {str(e)[:100]}")
+        ctx.add_trace(f"Judge error: {str(e)[:100]}")
         fallback_winner = anon.shuffled[0].name if anon.shuffled else ""
         return {"winner": fallback_winner, "rankings": [], "confidence": 0.0, "disagreement_level": "error"}
 
 
-async def synthesize_final(
-    client: RouterClient,
-    synthesizer_config: dict,
-    winner: Candidate,
-    judge_result: dict,
-    verification_report: VerificationReport,
-    user_prompt: str,
-    trace: list[str],
-    max_repair_rounds: int = 2,
-    critique: dict | None = None,
-    anon: AnonMapping | None = None,
-) -> str:
+async def synthesize_final(client: RouterClient, ctx: RunContext) -> str:
+    synthesizer_config = ctx.policy.synthesizer_config
+    winner = ctx.winner
+    if winner is None:
+        ctx.add_trace("Synthesis skipped — no winner")
+        return ctx.answer
 
+    verification_report = ctx.verification
     failures = verification_report.failures if verification_report else []
     verification_summary = failure_text = unverified_text = ""
     if verification_report:
@@ -445,19 +406,19 @@ async def synthesize_final(
             verification_summary = f"All external checks passed ({len(verification_report.results)} checks)"
 
     judge_summary = ""
-    if judge_result:
-        judge_summary = json.dumps(judge_result, indent=2)[:1000]
+    if ctx.judge_result:
+        judge_summary = json.dumps(ctx.judge_result, indent=2)[:1000]
 
     critique_section = ""
-    if critique and (critique.get("critic") or critique.get("evidence_verifier") or critique.get("devil_advocate")):
-        winner_label = anon.label_of(winner) if anon else "winner"
+    if ctx.critique and (ctx.critique.get("critic") or ctx.critique.get("evidence_verifier") or ctx.critique.get("devil_advocate")):
+        winner_label = ctx.anon.label_of(winner) if ctx.anon else "winner"
         critique_section = "\n\nAdversarial critique:\n"
-        if critique.get("critic"):
-            critique_section += f"Critic findings (re: {winner_label}):\n{critique['critic'][:1000]}\n"
-        if critique.get("evidence_verifier"):
-            critique_section += f"Evidence (re: {winner_label}): {critique['evidence_verifier'][:1000]}\n"
-        if critique.get("devil_advocate"):
-            critique_section += f"Devil's advocate: {critique['devil_advocate'][:1000]}\n"
+        if ctx.critique.get("critic"):
+            critique_section += f"Critic findings (re: {winner_label}):\n{ctx.critique['critic'][:1000]}\n"
+        if ctx.critique.get("evidence_verifier"):
+            critique_section += f"Evidence (re: {winner_label}): {ctx.critique['evidence_verifier'][:1000]}\n"
+        if ctx.critique.get("devil_advocate"):
+            critique_section += f"Devil's advocate: {ctx.critique['devil_advocate'][:1000]}\n"
 
     verification_section = (
         f"The following checks FAILED and must be fixed:\n{failure_text}"
@@ -465,7 +426,7 @@ async def synthesize_final(
         else verification_summary
     )
 
-    synth_prompt = f"""Original problem: {user_prompt}
+    synth_prompt = f"""Original problem: {ctx.raw_prompt}
 
 The winning candidate's answer:
 {winner.content[:3000]}
@@ -481,7 +442,7 @@ If external checks failed, repair ONLY the specific failures. Do not rewrite con
 If items are UNVERIFIED, note the uncertainty but do not rewrite unless there is a specific failure."""
 
     messages = [
-        {"role": "system", "content": synthesizer_config["system_prompt"]},
+        {"role": "system", "content": synthesizer_config.system_prompt},
         {"role": "user", "content": synth_prompt},
     ]
 
@@ -490,76 +451,143 @@ If items are UNVERIFIED, note the uncertainty but do not rewrite unless there is
     needs_repair = verification_report and verification_report.has_failures
     needs_synthesis = verification_report and verification_report.all_passed and not verification_report.has_unverified
 
-    if needs_synthesis:
-        trace.append(f"Verification passed — running final synthesis ({winner.name})")
-        try:
-            result = await asyncio.wait_for(
-                client.chat(
-                    model=synthesizer_config["model"],
-                    messages=messages,
-                    temperature=synthesizer_config.get("temperature", 0.2),
-                    reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
-                    max_tokens=1024,
-                ),
-                timeout=30,
-            )
-            answer = result.content
-            trace.append(f"Synthesis done [{result.latency_ms:.0f}ms]")
-        except Exception as e:
-            trace.append(f"Synthesis error (keeping winner): {str(e)[:100]}")
-    elif needs_repair:
-        for round_num in range(max_repair_rounds if failures else 1):
-            try:
-                result = await asyncio.wait_for(
-                    client.chat(
-                        model=synthesizer_config["model"],
-                        messages=messages,
-                        temperature=synthesizer_config.get("temperature", 0.2),
-                        reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
-                        max_tokens=1024,
-                    ),
-                    timeout=30,
-                )
-                answer = result.content
-                trace.append(f"Synthesis/repair round {round_num + 1}: done [{result.latency_ms:.0f}ms]")
+    async def _synthesize_once() -> str:
+        result = await budgeted_chat(
+            client,
+            ctx,
+            agent_name="synthesizer",
+            model=synthesizer_config.model,
+            messages=messages,
+            temperature=synthesizer_config.temperature,
+            reasoning_effort=synthesizer_config.reasoning_effort,
+            max_tokens=synthesizer_config.max_tokens,
+            timeout=synthesizer_config.timeout_seconds,
+        )
+        return result.content
 
-                repair_verif = await verify_answer(answer, user_prompt)
+    if needs_synthesis:
+        ctx.add_trace(f"Verification passed — running final synthesis ({winner.name})")
+        try:
+            answer = await _synthesize_once()
+            ctx.add_trace("Synthesis done")
+        except BudgetExhaustedError as e:
+            ctx.add_trace(f"Synthesis skipped (keeping winner): {e}")
+        except Exception as e:
+            ctx.add_trace(f"Synthesis error (keeping winner): {str(e)[:100]}")
+    elif needs_repair:
+        for round_num in range(ctx.policy.max_repair_rounds if failures else 1):
+            try:
+                answer = await _synthesize_once()
+                ctx.add_trace(f"Synthesis/repair round {round_num + 1}: done")
+
+                repair_verif = await verify_answer(answer, ctx.raw_prompt)
                 if not repair_verif.has_failures:
-                    trace.append("Repair successful — no failures remain")
+                    ctx.add_trace("Repair successful — no failures remain")
                     break
                 else:
-                    trace.append(f"Repair round {round_num + 1} still has failures: {repair_verif.failures}")
+                    ctx.add_trace(f"Repair round {round_num + 1} still has failures: {repair_verif.failures}")
                     prev_failures = set(failures)
                     current_failures = set(repair_verif.failures)
                     if prev_failures == current_failures:
-                        trace.append("Same failures as before — stopping repair")
+                        ctx.add_trace("Same failures as before — stopping repair")
                         break
-
+            except BudgetExhaustedError as e:
+                ctx.add_trace(f"Synthesis repair skipped (keeping winner): {e}")
+                break
             except Exception as e:
-                trace.append(f"Synthesis error: {str(e)[:100]}")
+                ctx.add_trace(f"Synthesis error: {str(e)[:100]}")
                 break
     else:
-        trace.append(f"Running synthesis with unverified items ({winner.name})")
+        ctx.add_trace(f"Running synthesis with unverified items ({winner.name})")
         try:
-            result = await asyncio.wait_for(
-                client.chat(
-                    model=synthesizer_config["model"],
-                    messages=messages,
-                    temperature=synthesizer_config.get("temperature", 0.2),
-                    reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
-                    max_tokens=1024,
-                ),
-                timeout=30,
-            )
-            answer = result.content
-            trace.append(f"Synthesis done [{result.latency_ms:.0f}ms]")
+            answer = await _synthesize_once()
+            ctx.add_trace("Synthesis done")
+        except BudgetExhaustedError as e:
+            ctx.add_trace(f"Synthesis skipped (keeping winner): {e}")
         except Exception as e:
-            trace.append(f"Synthesis error (keeping winner): {str(e)[:100]}")
+            ctx.add_trace(f"Synthesis error (keeping winner): {str(e)[:100]}")
 
     return answer
 
 
-async def run_full_pipeline(
+async def run_full_pipeline(client: RouterClient, ctx: RunContext) -> PipelineResult:
+    """Run the full pipeline against the RunContext, mutating it as it goes."""
+    t0 = time.monotonic()
+
+    solver_configs = ctx.policy.solver_configs
+    reviewer_configs = ctx.policy.reviewer_configs
+
+    if not solver_configs:
+        ctx.add_trace("No solvers configured — nothing to run")
+        ctx.mode = "full"
+        ctx.answer = "No solvers configured."
+        return PipelineResult(
+            answer=ctx.answer, mode="full",
+            total_latency_ms=(time.monotonic() - t0) * 1000,
+            pipeline_trace=list(ctx.trace),
+        )
+
+    ctx.add_trace(f"Starting full pipeline: {len(solver_configs)} solvers, {len(reviewer_configs)} reviewers")
+
+    await generate_candidates(client, ctx)
+
+    ctx.anon = create_anon_mapping(ctx.candidates)
+    ctx.add_trace(f"Anonymized {len(ctx.anon.shuffled)} candidates: " +
+                  ", ".join(f"{ctx.anon.labels[i]}={ctx.anon.shuffled[i].name}" for i in range(len(ctx.anon.shuffled))))
+
+    await critique_candidates(client, ctx)
+
+    ctx.clustering = cluster_candidates(ctx.candidates)
+    ctx.add_trace(f"Clustering: {len(ctx.clustering.clusters)} cluster(s), disagreement={ctx.clustering.disagreement_level}")
+
+    if ctx.clustering.disagreement_level == "high":
+        ctx.candidates = await debate_disagreeing_candidates(client, ctx)
+        # Persistent anon IDs: update candidates in-place, do NOT re-create mapping.
+        ctx.anon.update_candidates(ctx.candidates)
+        ctx.clustering = cluster_candidates(ctx.candidates)
+        ctx.add_trace(f"Post-debate clustering: {len(ctx.clustering.clusters)} cluster(s), disagreement={ctx.clustering.disagreement_level}")
+
+    ctx.judge_result = await judge_candidates(client, ctx)
+
+    winner_name = ctx.judge_result.get("winner", "")
+    ctx.winner = next(
+        (c for c in ctx.candidates if c.name == winner_name and not c.error), None
+    )
+    if ctx.winner is None:
+        valid = [c for c in ctx.candidates if not c.error and c.content]
+        if ctx.clustering and ctx.clustering.leader:
+            ctx.winner = ctx.clustering.leader
+        elif valid:
+            ctx.winner = valid[0]
+        else:
+            ctx.mode = "full"
+            ctx.answer = "All candidates failed."
+            ctx.add_trace("No valid candidates — all failed")
+            return PipelineResult(
+                answer=ctx.answer, mode="full", candidates=ctx.candidates,
+                total_latency_ms=(time.monotonic() - t0) * 1000,
+                pipeline_trace=list(ctx.trace),
+            )
+
+    ctx.verification = await verify_answer(ctx.winner.content, ctx.raw_prompt, ctx.policy.verification_timeout)
+    ctx.add_trace(f"Verification: {ctx.verification.status} ({len(ctx.verification.results)} checks)")
+
+    ctx.answer = await synthesize_final(client, ctx)
+    ctx.mode = "full"
+
+    return PipelineResult(
+        answer=ctx.answer,
+        mode="full",
+        candidates=ctx.candidates,
+        clusters=ctx.clustering,
+        judge_result=ctx.judge_result,
+        verification_report=ctx.verification,
+        total_latency_ms=(time.monotonic() - t0) * 1000,
+        pipeline_trace=list(ctx.trace),
+    )
+
+
+async def run_full_pipeline_legacy(
     client: RouterClient,
     user_prompt: str,
     candidates_config: list[dict],
@@ -569,105 +597,52 @@ async def run_full_pipeline(
     max_repair_rounds: int = 2,
     verification_timeout: int = 30,
 ) -> PipelineResult:
+    """Legacy entry point for the benchmark harness: builds a RunContext from dict configs.
 
-    t0 = time.monotonic()
-    trace: list[str] = []
+    Every config dict must carry an explicit 'role' — no name inference.
+    """
+    from ..agents import AgentConfig
+    from ..context import PolicyResult
 
-    # Separate solver candidates from reviewer candidates using AgentRole
-    solver_configs = []
-    reviewer_configs = []
+    policy = PolicyResult(
+        debate_rounds=debate_rounds,
+        max_repair_rounds=max_repair_rounds,
+        verification_timeout=verification_timeout,
+    )
     for cfg in candidates_config:
-        role_str = cfg.get("role", "")
-        if isinstance(role_str, AgentRole):
-            role = role_str
-        elif role_str:
-            try:
-                role = AgentRole(role_str)
-            except ValueError:
-                role = _infer_role_from_name(cfg.get("name", ""))
-        else:
-            role = _infer_role_from_name(cfg.get("name", ""))
-
-        if role.is_solver:
-            solver_configs.append(cfg)
-        elif role.is_reviewer:
-            reviewer_configs.append(cfg)
-
-    if not solver_configs:
-        solver_configs = candidates_config
-
-    trace.append(f"Starting full pipeline: {len(solver_configs)} solvers, {len(reviewer_configs)} reviewers")
-
-    candidates = await generate_candidates(client, solver_configs, user_prompt, trace)
-
-    # Create shared anonymization mapping BEFORE reviewers so all agents use same labels
-    anon = create_anon_mapping(candidates)
-    trace.append(f"Anonymized {len(anon.shuffled)} candidates: " +
-                 ", ".join(f"{anon.labels[i]}={anon.shuffled[i].name}" for i in range(len(anon.shuffled))))
-
-    critique = await critique_candidates(
-        client,
-        reviewer_configs if reviewer_configs else candidates_config,
-        candidates,
-        user_prompt,
-        trace,
-        anon=anon,
-    )
-
-    clustering_result = cluster_candidates(candidates)
-    trace.append(f"Clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
-
-    if clustering_result.disagreement_level == "high":
-        candidates = await debate_disagreeing_candidates(
-            client, clustering_result, solver_configs, candidates,
-            user_prompt, debate_rounds, trace,
+        role = AgentRole(cfg["role"])
+        ac = AgentConfig(
+            name=cfg["name"],
+            role=role,
+            model=cfg["model"],
+            system_prompt=cfg["system_prompt"],
+            temperature=cfg.get("temperature", 0.3),
+            reasoning_effort=cfg.get("reasoning_effort", "none"),
         )
-        # Persistent anon IDs: update candidates in-place, do NOT re-create mapping.
-        # Labels are preserved — Candidate A is still Candidate A after debate.
-        anon.update_candidates(candidates)
-        clustering_result = cluster_candidates(candidates)
-        trace.append(f"Post-debate clustering: {len(clustering_result.clusters)} cluster(s), disagreement={clustering_result.disagreement_level}")
+        if role.is_solver:
+            policy.solver_configs.append(ac)
+        elif role.is_reviewer:
+            policy.reviewer_configs.append(ac)
 
-    judge_result = await judge_candidates(
-        client, judge_config, candidates, user_prompt, trace, critique=critique, anon=anon,
-    )
+    if judge_config:
+        policy.judge_config = AgentConfig(
+            name="judge",
+            role=AgentRole.JUDGE,
+            model=judge_config["model"],
+            system_prompt=judge_config["system_prompt"],
+            temperature=judge_config.get("temperature", 0.1),
+            reasoning_effort=judge_config.get("reasoning_effort", "none"),
+        )
+    if synthesizer_config:
+        policy.synthesizer_config = AgentConfig(
+            name="synthesizer",
+            role=AgentRole.SYNTHESIZER,
+            model=synthesizer_config["model"],
+            system_prompt=synthesizer_config["system_prompt"],
+            temperature=synthesizer_config.get("temperature", 0.2),
+            reasoning_effort=synthesizer_config.get("reasoning_effort", "none"),
+        )
 
-    winner_name = judge_result.get("winner", "")
-    winner = None
-    for c in candidates:
-        if c.name == winner_name and not c.error:
-            winner = c
-            break
-    if winner is None:
-        valid = [c for c in candidates if not c.error and c.content]
-        if clustering_result.leader:
-            winner = clustering_result.leader
-        elif valid:
-            winner = valid[0]
-        else:
-            return PipelineResult(
-                answer="All candidates failed.",
-                mode="full",
-                candidates=candidates,
-                total_latency_ms=(time.monotonic() - t0) * 1000,
-                pipeline_trace=trace + ["No valid candidates — all failed"],
-            )
-
-    verification = await verify_answer(winner.content, user_prompt, verification_timeout)
-    trace.append(f"Verification: {verification.status} ({len(verification.results)} checks)")
-
-    final_answer = await synthesize_final(
-        client, synthesizer_config, winner, judge_result, verification,
-        user_prompt, trace, max_repair_rounds, critique=critique, anon=anon,
-    )
-
-    return PipelineResult(
-        answer=final_answer,
-        mode="full",
-        candidates=candidates,
-        clusters=clustering_result,
-        judge_result=judge_result,
-        verification_report=verification,
-        total_latency_ms=(time.monotonic() - t0) * 1000,
-        pipeline_trace=trace,
-    )
+    ctx = RunContext(raw_prompt=user_prompt, policy=policy)
+    ctx.start()
+    return await run_full_pipeline(client, ctx)

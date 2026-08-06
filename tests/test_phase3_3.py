@@ -2,6 +2,8 @@
 persistent anon IDs through debate, and central routing decisions."""
 import os
 
+import pytest
+
 from nim_orchestrator.agents import AgentConfig, AgentRole
 from nim_orchestrator.budget import BudgetLimits, ExecutionBudget
 from nim_orchestrator.clustering import Candidate
@@ -370,19 +372,27 @@ class TestPersistentAnonIDs:
         assert anon.labels == original_labels
         assert anon.label_to_original == original_mapping
 
-    def test_no_name_based_role_detection(self):
-        """Acceptance: No role detection from names — roles come from config."""
-        from nim_orchestrator.pipeline.full_pipeline import _infer_role_from_name
+    def test_no_name_based_role_detection_in_source(self):
+        """Acceptance: No role detection from names anywhere in source code."""
+        import re
+        from pathlib import Path
 
-        # This function should only be used as fallback
-        assert _infer_role_from_name("adversarial_critic") == AgentRole.CRITIC
-        assert _infer_role_from_name("evidence_verifier") == AgentRole.EVIDENCE_VERIFIER
-        assert _infer_role_from_name("devil_advocate") == AgentRole.DEVILS_ADVOCATE
-        assert _infer_role_from_name("alternative_solver") == AgentRole.ALTERNATIVE_SOLVER
-        assert _infer_role_from_name("solver") == AgentRole.SOLVER
+        src_dir = Path(__file__).parents[1] / "src" / "nim_orchestrator"
+        forbidden_patterns = [
+            r"infer_role",          # any role inference helper
+            r"_detect_task_type",   # duplicate task classifier
+        ]
+        for py in src_dir.rglob("*.py"):
+            text = py.read_text()
+            for pattern in forbidden_patterns:
+                assert not re.search(pattern, text), (
+                    f"{py.name} still contains '{pattern}' — name-based role detection must be gone"
+                )
 
     async def test_critique_uses_agentrole_not_name(self):
         """Verify critique_candidates uses AgentRole for role detection."""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext
         from nim_orchestrator.pipeline.full_pipeline import critique_candidates
 
         class MockClient:
@@ -398,20 +408,19 @@ class TestPersistentAnonIDs:
             Candidate(name="x", model="m", content="answer 1"),
             Candidate(name="y", model="m", content="answer 2"),
         ]
-        anon = create_anon_mapping(candidates)
+        ctx = RunContext(raw_prompt="test")
+        ctx.candidates = candidates
+        ctx.anon = create_anon_mapping(candidates)
 
         # Config with explicit roles — names don't match role keywords
-        reviewer_configs = [
-            {"name": "reviewer_1", "model": "m", "system_prompt": "critic", "temperature": 0.2, "reasoning_effort": "none", "role": "critic"},
-            {"name": "reviewer_2", "model": "m", "system_prompt": "verifier", "temperature": 0.1, "reasoning_effort": "none", "role": "evidence_verifier"},
-            {"name": "reviewer_3", "model": "m", "system_prompt": "devil", "temperature": 0.7, "reasoning_effort": "none", "role": "devils_advocate"},
-        ]
+        ctx.policy = PolicyResult(reviewer_configs=[
+            AgentConfig(name="reviewer_1", role=AgentRole.CRITIC, model="m", system_prompt="critic", temperature=0.2),
+            AgentConfig(name="reviewer_2", role=AgentRole.EVIDENCE_VERIFIER, model="m", system_prompt="verifier", temperature=0.1),
+            AgentConfig(name="reviewer_3", role=AgentRole.DEVILS_ADVOCATE, model="m", system_prompt="devil", temperature=0.7),
+        ])
 
         mock = MockClient()
-        trace = []
-        await critique_candidates(
-            mock, reviewer_configs, candidates, "test", trace, anon=anon
-        )
+        await critique_candidates(mock, ctx)
 
         # All three reviewers should fire (3 chat calls)
         assert len(mock.captured) == 3
@@ -519,9 +528,19 @@ class TestConfigRoleField:
         c = CandidateConfig(name="test", model="m", system_prompt="p", role="critic")
         assert c.role == "critic"
 
-    def test_candidate_config_role_defaults_to_solver(self):
-        c = CandidateConfig(name="test", model="m", system_prompt="p")
-        assert c.role == "solver"
+    def test_candidate_config_role_required(self):
+        """Acceptance: missing role fails configuration validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CandidateConfig(name="test", model="m", system_prompt="p")
+
+    def test_candidate_config_role_must_be_valid(self):
+        """Acceptance: invalid role fails configuration validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CandidateConfig(name="test", model="m", system_prompt="p", role="banana")
 
     def test_judge_config_has_role(self):
         j = JudgeConfig(model="m", system_prompt="p", role="judge")

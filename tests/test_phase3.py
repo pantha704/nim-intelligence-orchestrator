@@ -5,9 +5,9 @@ import os
 import pytest
 
 from nim_orchestrator.clustering import Candidate, cluster_candidates
+from nim_orchestrator.policy import classify_task_type
 from nim_orchestrator.router_client import ChatResult
 from nim_orchestrator.speculative_router import (
-    _detect_task_type,
     _has_verification_available,
 )
 from nim_orchestrator.task_compiler import (
@@ -241,26 +241,26 @@ class TestPythonSyntaxVerification:
 
 
 class TestSpeculativeRouter:
-    def test_detect_task_type_code_writing(self):
-        assert _detect_task_type("Write a Python function to sort a list", "```python\ndef sort(lst): pass\n```") == "verifiable"
+    def test_classify_code_writing(self):
+        assert classify_task_type("Write a Python function to sort a list", "```python\ndef sort(lst): pass\n```") == "verifiable"
 
-    def test_detect_task_type_math(self):
-        assert _detect_task_type("Calculate the sum of 17 and 23", "The sum is 40") == "verifiable"
+    def test_classify_math(self):
+        assert classify_task_type("Calculate the sum of 17 and 23", "The sum is 40") == "verifiable"
 
-    def test_detect_task_type_direct_capital(self):
-        assert _detect_task_type("What is the capital of France?", "Paris") == "direct"
+    def test_classify_direct_capital(self):
+        assert classify_task_type("What is the capital of France?", "Paris") == "direct"
 
-    def test_detect_task_type_complex_prove(self):
-        assert _detect_task_type("Prove that the square root of 2 is irrational.", "Assume for contradiction...") == "complex"
+    def test_classify_complex_prove(self):
+        assert classify_task_type("Prove that the square root of 2 is irrational.", "Assume for contradiction...") == "complex"
 
-    def test_detect_task_type_complex_design(self):
-        assert _detect_task_type("Design a distributed cache system with consistent hashing.", "The system uses...") == "complex"
+    def test_classify_complex_design(self):
+        assert classify_task_type("Design a distributed cache system with consistent hashing.", "The system uses...") == "complex"
 
-    def test_detect_task_type_open_ended_think(self):
-        assert _detect_task_type("What do you think about Rust vs Go for systems programming?", "I think...") == "open_ended"
+    def test_classify_open_ended_think(self):
+        assert classify_task_type("What do you think about Rust vs Go for systems programming?", "I think...") == "open_ended"
 
-    def test_detect_task_type_open_ended_recommend(self):
-        assert _detect_task_type("Recommend me a good book on distributed systems.", "I recommend...") == "open_ended"
+    def test_classify_open_ended_recommend(self):
+        assert classify_task_type("Recommend me a good book on distributed systems.", "I recommend...") == "open_ended"
 
     def test_has_verification_available_code_blocks(self):
         assert _has_verification_available("Write code", "```python\nx = 1\n```") is True
@@ -325,6 +325,22 @@ class MockRouterClient:
 
 
 class TestJudgeOrderBias:
+    def _make_judge_ctx(self, candidates):
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext, create_anon_mapping
+
+        ctx = RunContext(raw_prompt="What is the answer?")
+        ctx.policy = PolicyResult(judge_config=AgentConfig(
+            name="judge",
+            role=AgentRole.JUDGE,
+            model="mock-model",
+            system_prompt="You are a judge.",
+            temperature=0.1,
+        ))
+        ctx.candidates = candidates
+        ctx.anon = create_anon_mapping(candidates)
+        return ctx
+
     async def test_judge_anonymizes_candidate_names(self):
         from nim_orchestrator.pipeline.full_pipeline import judge_candidates
 
@@ -332,15 +348,10 @@ class TestJudgeOrderBias:
             Candidate(name="ModelX", model="x", content="The answer is 42."),
             Candidate(name="ModelY", model="y", content="The answer is 99."),
         ]
-        judge_config = {
-            "model": "mock-model",
-            "system_prompt": "You are a judge.",
-            "temperature": 0.1,
-        }
+        ctx = self._make_judge_ctx(candidates)
 
         mock = MockRouterClient()
-        trace = []
-        await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace)
+        await judge_candidates(mock, ctx)
 
         assert len(mock.captured_messages) == 1
         messages = mock.captured_messages[0]
@@ -358,17 +369,12 @@ class TestJudgeOrderBias:
             Candidate(name="ModelX", model="x", content="The answer is 42."),
             Candidate(name="ModelY", model="y", content="The answer is 99."),
         ]
-        judge_config = {
-            "model": "mock-model",
-            "system_prompt": "You are a judge.",
-            "temperature": 0.1,
-        }
+        ctx = self._make_judge_ctx(candidates)
 
         mock = MockRouterClient(
             response_content='{"winner": "Candidate A", "rankings": [], "confidence": 0.9, "disagreement_level": "none"}'
         )
-        trace = []
-        result = await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace)
+        result = await judge_candidates(mock, ctx)
 
         assert result["winner"] in ("ModelX", "ModelY")
 
@@ -527,6 +533,8 @@ class TestSolverReviewerSeparation:
     async def test_pipeline_separates_solvers_from_reviewers(self):
         """Verify that run_full_pipeline only generates candidates from solver configs,
         not from critic/verifier configs."""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext
         from nim_orchestrator.pipeline.full_pipeline import generate_candidates
         from nim_orchestrator.router_client import ChatResult
 
@@ -539,14 +547,14 @@ class TestSolverReviewerSeparation:
             async def close(self):
                 pass
 
-        solver_configs = [
-            {"name": "solver", "model": "m", "system_prompt": "be a solver", "temperature": 0.3, "reasoning_effort": "none"},
-            {"name": "alternative_solver", "model": "m", "system_prompt": "be different", "temperature": 0.5, "reasoning_effort": "none"},
-        ]
+        ctx = RunContext(raw_prompt="test prompt")
+        ctx.policy = PolicyResult(solver_configs=[
+            AgentConfig(name="solver", role=AgentRole.SOLVER, model="m", system_prompt="be a solver", temperature=0.3),
+            AgentConfig(name="alternative_solver", role=AgentRole.ALTERNATIVE_SOLVER, model="m", system_prompt="be different", temperature=0.5),
+        ])
 
         mock = MockClient()
-        trace = []
-        candidates = await generate_candidates(mock, solver_configs, "test prompt", trace)
+        candidates = await generate_candidates(mock, ctx)
 
         # Only solver configs should generate candidates
         assert len(candidates) == 2
@@ -563,6 +571,24 @@ class TestSolverReviewerSeparation:
 
 
 class TestCritiqueFedToJudge:
+    def _make_ctx(self, candidates, critique=None):
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext, create_anon_mapping
+
+        ctx = RunContext(raw_prompt="What is the answer?")
+        ctx.policy = PolicyResult(judge_config=AgentConfig(
+            name="judge",
+            role=AgentRole.JUDGE,
+            model="mock-model",
+            system_prompt="You are a judge.",
+            temperature=0.1,
+        ))
+        ctx.candidates = candidates
+        ctx.anon = create_anon_mapping(candidates)
+        if critique is not None:
+            ctx.critique = critique
+        return ctx
+
     async def test_judge_receives_critique(self):
         from nim_orchestrator.pipeline.full_pipeline import judge_candidates
 
@@ -570,19 +596,14 @@ class TestCritiqueFedToJudge:
             Candidate(name="ModelX", model="x", content="The answer is 42."),
             Candidate(name="ModelY", model="y", content="The answer is 99."),
         ]
-        judge_config = {
-            "model": "mock-model",
-            "system_prompt": "You are a judge.",
-            "temperature": 0.1,
-        }
         critique = {
             "critic": "ModelX made an arithmetic error",
             "evidence_verifier": "ModelX's claim about 42 is UNVERIFIED",
         }
+        ctx = self._make_ctx(candidates, critique=critique)
 
         mock = MockRouterClient()
-        trace = []
-        await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace, critique=critique)
+        await judge_candidates(mock, ctx)
 
         messages = mock.captured_messages[0]
         user_msg = messages[1]["content"]
@@ -597,15 +618,10 @@ class TestCritiqueFedToJudge:
             Candidate(name="ModelX", model="x", content="The answer is 42."),
             Candidate(name="ModelY", model="y", content="The answer is 99."),
         ]
-        judge_config = {
-            "model": "mock-model",
-            "system_prompt": "You are a judge.",
-            "temperature": 0.1,
-        }
+        ctx = self._make_ctx(candidates)
 
         mock = MockRouterClient()
-        trace = []
-        await judge_candidates(mock, judge_config, candidates, "What is the answer?", trace, critique=None)
+        await judge_candidates(mock, ctx)
 
         messages = mock.captured_messages[0]
         user_msg = messages[1]["content"]
@@ -620,6 +636,8 @@ class TestCritiqueFedToJudge:
 class TestSharedAnonIDs:
     async def test_critique_uses_same_labels_as_judge(self):
         """Verify that critiqued candidates and judge candidates share the same anonymous labels."""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext
         from nim_orchestrator.pipeline.full_pipeline import (
             create_anon_mapping,
             critique_candidates,
@@ -630,25 +648,27 @@ class TestSharedAnonIDs:
             Candidate(name="solver", model="m", content="The answer is 42."),
             Candidate(name="alt_solver", model="m", content="The answer is 99."),
         ]
-        reviewer_configs = [
-            {"name": "adversarial_critic", "model": "mock", "system_prompt": "Be a critic.", "temperature": 0.2, "reasoning_effort": "none"},
-        ]
-        judge_config = {"model": "mock", "system_prompt": "Be a judge.", "temperature": 0.1, "reasoning_effort": "none"}
-
-        anon = create_anon_mapping(candidates)
-        assert len(anon.shuffled) == 2
-        assert len(anon.labels) == 2
+        ctx = RunContext(raw_prompt="test")
+        ctx.policy = PolicyResult(
+            reviewer_configs=[
+                AgentConfig(name="adversarial_critic", role=AgentRole.CRITIC, model="mock", system_prompt="Be a critic.", temperature=0.2),
+            ],
+            judge_config=AgentConfig(name="judge", role=AgentRole.JUDGE, model="mock", system_prompt="Be a judge.", temperature=0.1),
+        )
+        ctx.candidates = candidates
+        ctx.anon = create_anon_mapping(candidates)
+        assert len(ctx.anon.shuffled) == 2
+        assert len(ctx.anon.labels) == 2
 
         # Critique with the shared mapping
         mock = MockRouterClient()
-        trace = []
-        await critique_candidates(mock, reviewer_configs, candidates, "test", trace, anon=anon)
+        await critique_candidates(mock, ctx)
 
         # Judge with the SAME shared mapping
         mock2 = MockRouterClient(
             response_content='{"winner": "Candidate A", "rankings": [], "confidence": 0.9, "disagreement_level": "none"}'
         )
-        await judge_candidates(mock2, judge_config, candidates, "test", trace, anon=anon)
+        await judge_candidates(mock2, ctx)
 
         # Both should reference the same anonymous labels, never original names
         critique_msg = mock.captured_messages[0][1]["content"]
@@ -660,19 +680,22 @@ class TestSharedAnonIDs:
 
     async def test_devil_advocate_executed(self):
         """Verify that devil_advocate reviewer is invoked when configured."""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext
         from nim_orchestrator.pipeline.full_pipeline import create_anon_mapping, critique_candidates
 
         candidates = [Candidate(name="solver", model="m", content="The answer is 42.")]
-        reviewer_configs = [
-            {"name": "adversarial_critic", "model": "mock", "system_prompt": "Critic.", "temperature": 0.2, "reasoning_effort": "none"},
-            {"name": "evidence_verifier", "model": "mock", "system_prompt": "Verifier.", "temperature": 0.1, "reasoning_effort": "none"},
-            {"name": "devil_advocate", "model": "mock", "system_prompt": "Devil.", "temperature": 0.7, "reasoning_effort": "none"},
-        ]
-        anon = create_anon_mapping(candidates)
+        ctx = RunContext(raw_prompt="test prompt")
+        ctx.policy = PolicyResult(reviewer_configs=[
+            AgentConfig(name="adversarial_critic", role=AgentRole.CRITIC, model="mock", system_prompt="Critic.", temperature=0.2),
+            AgentConfig(name="evidence_verifier", role=AgentRole.EVIDENCE_VERIFIER, model="mock", system_prompt="Verifier.", temperature=0.1),
+            AgentConfig(name="devil_advocate", role=AgentRole.DEVILS_ADVOCATE, model="mock", system_prompt="Devil.", temperature=0.7),
+        ])
+        ctx.candidates = candidates
+        ctx.anon = create_anon_mapping(candidates)
 
         mock = MockRouterClient()
-        trace = []
-        result = await critique_candidates(mock, reviewer_configs, candidates, "test prompt", trace, anon=anon)
+        result = await critique_candidates(mock, ctx)
 
         # All three reviewers should have been called (3 chat calls)
         assert len(mock.captured_messages) == 3
@@ -680,6 +703,8 @@ class TestSharedAnonIDs:
 
     async def test_synthesizer_uses_anon_label_for_winner(self):
         """Synthesizer should reference the winner by its anonymous label in critique context."""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.context import PolicyResult, RunContext
         from nim_orchestrator.pipeline.full_pipeline import create_anon_mapping, synthesize_final
         from nim_orchestrator.verifiers.external_checks import VerificationReport
 
@@ -687,29 +712,26 @@ class TestSharedAnonIDs:
             Candidate(name="solver", model="m", content="The answer is 42."),
             Candidate(name="alt_solver", model="m", content="The answer is 99."),
         ]
-        anon = create_anon_mapping(candidates)
+        ctx = RunContext(raw_prompt="What is the answer?")
+        ctx.policy = PolicyResult(
+            synthesizer_config=AgentConfig(name="synthesizer", role=AgentRole.SYNTHESIZER, model="mock", system_prompt="Synthesize.", temperature=0.2),
+            max_repair_rounds=2,
+        )
+        ctx.anon = create_anon_mapping(candidates)
+        ctx.candidates = candidates
 
         winner = candidates[0]  # solver
-        winner_label = anon.label_of(winner)
+        ctx.winner = winner
+        winner_label = ctx.anon.label_of(winner)
 
         report = VerificationReport()
         report.add(VerificationResult(verifier_name="arithmetic", status="pass", details="42 is correct"))
-
-        critique = {"critic": f"Candidate {winner_label} has a minor issue."}
+        ctx.verification = report
+        ctx.judge_result = {"winner": "solver", "confidence": 0.9}
+        ctx.critique = {"critic": f"Candidate {winner_label} has a minor issue."}
 
         mock = MockRouterClient()
-        trace = []
-        await synthesize_final(
-            mock,
-            {"model": "mock", "system_prompt": "Synthesize.", "temperature": 0.2, "reasoning_effort": "none"},
-            winner,
-            {"winner": "solver", "confidence": 0.9},
-            report,
-            "What is the answer?",
-            trace,
-            critique=critique,
-            anon=anon,
-        )
+        await synthesize_final(mock, ctx)
 
         synth_msg = mock.captured_messages[0][1]["content"]
         assert winner_label in synth_msg
@@ -757,11 +779,11 @@ class TestVerificationStatus:
 class TestMathRouteHonesty:
     def test_what_is_number_is_direct(self):
         """Verify 'What is 17 * 23?' is classified as 'direct' not 'verifiable'."""
-        assert _detect_task_type("What is 17 * 23?", "The answer is 391") == "direct"
+        assert classify_task_type("What is 17 * 23?", "The answer is 391") == "direct"
 
     def test_calculate_is_still_verifiable(self):
         """Verify 'Calculate 17 * 23' is still 'verifiable'."""
-        assert _detect_task_type("Calculate 17 * 23", "391") == "verifiable"
+        assert classify_task_type("Calculate 17 * 23", "391") == "verifiable"
 
     async def test_math_prompt_does_not_escalate_to_full(self):
         """End-to-end test: 'What is 17 * 23?' should return mode='direct' not 'full'."""
@@ -788,8 +810,8 @@ class TestMathRouteHonesty:
             router_base_url="http://mock",
             router_api_key="mock",
             candidates=[
-                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none"),
-                CandidateConfig(name="alt", model="m", system_prompt="Alt.", temperature=0.5, reasoning_effort="none"),
+                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none", role="solver"),
+                CandidateConfig(name="alt", model="m", system_prompt="Alt.", temperature=0.5, reasoning_effort="none", role="alternative_solver"),
             ],
             judge=JudgeConfig(model="m", system_prompt="Judge.", temperature=0.1, reasoning_effort="none"),
             synthesizer=SynthesizerConfig(model="m", system_prompt="Synth.", temperature=0.2, reasoning_effort="none"),
@@ -830,7 +852,7 @@ class TestMathRouteHonesty:
             router_base_url="http://mock",
             router_api_key="mock",
             candidates=[
-                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none"),
+                CandidateConfig(name="solver", model="m", system_prompt="Solve.", temperature=0.3, reasoning_effort="none", role="solver"),
             ],
             judge=JudgeConfig(model="m", system_prompt="Judge.", temperature=0.1, reasoning_effort="none"),
             synthesizer=SynthesizerConfig(model="m", system_prompt="Synth.", temperature=0.2, reasoning_effort="none"),

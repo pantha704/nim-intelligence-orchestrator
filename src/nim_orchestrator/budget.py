@@ -1,4 +1,5 @@
 """Execution budget: tracks and enforces limits on model calls, time, and agents."""
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -19,15 +20,28 @@ class ExecutionBudget:
     agents_used: int = 0
     _start_time: float = 0.0
     _call_log: list[dict] = field(default_factory=list)
+    _semaphore: asyncio.Semaphore | None = None
 
     def start(self) -> None:
         self._start_time = time.monotonic()
+        self._semaphore = asyncio.Semaphore(self.limits.max_concurrent_agents)
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.limits.max_concurrent_agents)
+        return self._semaphore
 
     @property
     def elapsed_seconds(self) -> float:
         if self._start_time == 0:
             return 0.0
         return time.monotonic() - self._start_time
+
+    @property
+    def exhausted(self) -> bool:
+        """True when no more model calls can be made."""
+        return not self.can_call()
 
     def record_call(self, agent_name: str, model: str, latency_ms: float, tokens: int = 0) -> None:
         self.model_calls += 1

@@ -62,6 +62,7 @@ def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
 @dataclass
 class PolicyResult:
     """Single source of truth for all routing decisions."""
+    action: str = "full"  # "single" | "speculative" | "full" — what the API executes
     route: str = "complex"  # "direct" | "verifiable" | "complex" | "open_ended"
     should_bypass_compiler: bool = False
     should_speculate: bool = False

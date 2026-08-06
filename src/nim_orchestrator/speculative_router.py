@@ -1,15 +1,16 @@
 """Structured speculative router.
 
-Replaces style-based confidence (which rewarded assertiveness and brevity)
-with structured routing signals: task type, ambiguity, verification availability,
-risk, and candidate disagreement. Never treats assertiveness or brevity as correctness.
+Uses classify_task_type from policy.py as the single task classifier.
+Routes based on task type, verification availability, and truncation —
+never on assertiveness, brevity, or token count.
 """
 
 import asyncio
 import re
 from dataclasses import dataclass
 
-from .router_client import ChatResult, RouterClient
+from .policy import classify_task_type
+from .router_client import BudgetExhaustedError, ChatResult, RouterClient, budgeted_chat
 
 
 @dataclass
@@ -18,37 +19,8 @@ class SpeculativeResult:
     quick_answer: str = ""
     quick_result: ChatResult | None = None
     reason: str = ""
-    route: str = "complex"  # "direct" / "verifiable" / "complex" / "open_ended"
+    route: str = "complex"
     signals: dict | None = None
-
-
-def _detect_task_type(prompt: str, answer: str) -> str:
-    """Classify the task type from the prompt and answer."""
-    prompt_lower = prompt.lower()
-
-    if re.search(r"\b(?:write|implement|code|function|class|program|script)\b", prompt_lower):
-        if "```" in answer or "def " in answer or "function " in answer:
-            return "verifiable"
-        return "verifiable"
-
-    if re.search(r"\b(?:calculate|compute|solve|how much|how many)\b", prompt_lower):
-        return "verifiable"
-
-    if re.search(r"\b(?:what is \d|what'?s \d)\b", prompt_lower):
-        # "What is 17 * 23?" — math question that the speculative answer can handle directly.
-        # Verification is available but the speculative answer is usually correct for arithmetic.
-        return "direct"
-
-    if re.search(r"\b(?:prove|design|architect|analyze|optimize|compare|trade-off|debug|refactor)\b", prompt_lower):
-        return "complex"
-
-    if re.search(r"\b(?:what do you think|best|worst|favorite|recommend|advise|opinion|should i)\b", prompt_lower):
-        return "open_ended"
-
-    if re.search(r"\b(?:what is|define|who is|when did|where is|capital of)\b", prompt_lower):
-        return "direct"
-
-    return "complex"
 
 
 def _has_verification_available(prompt: str, answer: str) -> bool:
@@ -74,22 +46,41 @@ async def speculative_route(
     model: str,
     prompt: str,
     max_quick_tokens: int = 256,
+    ctx=None,
 ) -> SpeculativeResult:
     """Quick speculative call producing structured routing signals.
 
-    Does NOT use assertiveness, brevity, or token count as confidence.
-    Routes based on task type, verification availability, and risk.
+    Task classification comes from policy.classify_task_type — the single
+    classifier. When ctx is provided, the call runs under budget enforcement.
     """
     try:
-        result = await asyncio.wait_for(
-            client.chat(
+        if ctx is not None:
+            result = await budgeted_chat(
+                client,
+                ctx,
+                agent_name="speculative",
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 reasoning_effort="none",
                 max_tokens=max_quick_tokens,
-            ),
-            timeout=20,
+                timeout=20,
+            )
+        else:
+            result = await asyncio.wait_for(
+                client.chat(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    reasoning_effort="none",
+                    max_tokens=max_quick_tokens,
+                ),
+                timeout=20,
+            )
+    except BudgetExhaustedError as e:
+        return SpeculativeResult(
+            escalate=True,
+            reason=f"budget exhausted — cannot make speculative call: {e}",
         )
     except Exception as e:
         return SpeculativeResult(
@@ -104,7 +95,7 @@ async def speculative_route(
             quick_result=result,
         )
 
-    task_type = _detect_task_type(prompt, result.content)
+    task_type = classify_task_type(prompt, result.content)
     verifiable = _has_verification_available(prompt, result.content)
     truncation = _detect_truncation(result)
 
@@ -116,8 +107,6 @@ async def speculative_route(
     }
 
     # Routing decisions based on structured signals, not style
-
-    # If truncated, the answer is incomplete — escalate
     if truncation == "truncated":
         return SpeculativeResult(
             escalate=True,

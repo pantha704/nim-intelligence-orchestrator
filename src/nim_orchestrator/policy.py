@@ -1,7 +1,12 @@
-"""Central PolicyEngine: single decision-making authority for routing, agent selection, and verification."""
+"""Central PolicyEngine: single decision-making authority for routing, agent selection, and verification.
+
+The API layer executes PolicyResult — it never makes routing decisions itself.
+Forced modes, compiler bypass, speculative routing and escalation all live here.
+"""
 from .agents import AgentConfig, AgentRole
 from .config import Settings
 from .context import PolicyResult
+from .router_client import BudgetExhaustedError, budgeted_chat
 from .task_compiler import should_bypass_compiler
 
 
@@ -9,8 +14,7 @@ def classify_task_type(prompt: str, answer: str = "") -> str:
     """Classify the task type from the prompt (and optionally the answer).
 
     This is the SINGLE source of truth for task type classification.
-    Replaces the duplicated _detect_task_type in speculative_router and
-    the keyword lists in difficulty_router.
+    No other module implements its own task classifier.
     """
     import re
     p = prompt.lower()
@@ -37,17 +41,23 @@ def classify_task_type(prompt: str, answer: str = "") -> str:
 
 
 class PolicyEngine:
-    """Central policy authority. All routing decisions go through here."""
+    """Central policy authority. ALL routing decisions go through here."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
 
     def decide(self, raw_prompt: str, task_spec=None, force_mode: str | None = None) -> PolicyResult:
-        """Produce a single PolicyResult capturing ALL routing decisions."""
+        """Produce a single PolicyResult capturing ALL routing decisions.
+
+        The result's `action` field tells the API what to execute:
+        "single" (one direct chat call), "speculative" (quick call with
+        escalation), or "full" (the multi-agent pipeline).
+        """
         result = PolicyResult()
 
-        # Force modes
+        # Force modes — owned by PolicyEngine
         if force_mode == "single":
+            result.action = "single"
             result.route = "direct"
             result.should_bypass_compiler = True
             result.should_speculate = True
@@ -56,6 +66,7 @@ class PolicyEngine:
             return result
 
         if force_mode == "full":
+            result.action = "full"
             result.route = "complex"
             result.should_bypass_compiler = False
             result.should_speculate = False
@@ -64,27 +75,30 @@ class PolicyEngine:
             self._populate_agents(result)
             return result
 
-        # Compiler bypass check
+        # Compiler bypass — owned by PolicyEngine
         result.should_bypass_compiler = should_bypass_compiler(raw_prompt)
 
         if result.should_bypass_compiler:
+            result.action = "speculative"
             result.route = "direct"
             result.should_speculate = True
             result.should_run_full_pipeline = False
             result.reason = "compiler bypassed — simple query"
             return result
 
-        # Use TaskSpec route if available
+        # Use TaskSpec route if available, otherwise classify
         if task_spec and task_spec.recommended_route:
             result.route = task_spec.recommended_route
         else:
             result.route = classify_task_type(raw_prompt)
 
         if result.route == "direct":
+            result.action = "speculative"
             result.should_speculate = True
             result.should_run_full_pipeline = False
             result.reason = f"direct route (route={result.route})"
         else:
+            result.action = "full"
             result.should_speculate = False
             result.should_run_full_pipeline = True
             result.reason = f"{result.route} route — full pipeline"
@@ -92,25 +106,63 @@ class PolicyEngine:
         self._populate_agents(result)
         return result
 
+    async def execute_single(self, ctx, client) -> None:
+        """Forced single mode — one budgeted direct chat call."""
+        try:
+            result = await budgeted_chat(
+                client,
+                ctx,
+                agent_name="single",
+                model="deepseek-v4-flash",
+                messages=[{"role": "user", "content": ctx.raw_prompt}],
+                temperature=0.2,
+                max_tokens=256,
+                timeout=30,
+            )
+            ctx.answer = result.content
+            ctx.mode = "single"
+            ctx.total_latency_ms = result.latency_ms
+            ctx.add_trace("forced single mode — direct chat call")
+        except BudgetExhaustedError as e:
+            ctx.mode = "error"
+            ctx.add_trace(f"single mode skipped: {e}")
+
+    async def execute_speculative(self, ctx, client) -> bool:
+        """Run the speculative quick call.
+
+        Returns True when the direct answer is accepted (ctx.answer/mode set),
+        False when it must escalate to the full pipeline. The escalation
+        decision is made here, not in the API.
+        """
+        from .speculative_router import speculative_route
+
+        spec = await speculative_route(
+            client,
+            model="deepseek-v4-flash",
+            prompt=ctx.raw_prompt,
+            max_quick_tokens=256,
+            ctx=ctx,
+        )
+        ctx.add_trace(f"Speculative route: {spec.reason} (route={spec.route})")
+
+        if spec.escalate:
+            ctx.add_trace("Speculative route: escalating to full pipeline")
+            return False
+
+        ctx.answer = spec.quick_answer
+        ctx.mode = "direct"
+        ctx.total_latency_ms = spec.quick_result.latency_ms if spec.quick_result else 0
+        ctx.add_trace(f"Speculative route: accepted direct answer ({ctx.total_latency_ms:.0f}ms)")
+        return True
+
     def _populate_agents(self, result: PolicyResult) -> None:
-        """Split settings.candidates into solvers and reviewers by AgentRole."""
+        """Split settings.candidates into solvers and reviewers by AgentRole.
+
+        No name-based inference anywhere — the role field is required on
+        CandidateConfig and Literal-validated at config load time.
+        """
         for c in self.settings.candidates:
-            role_str = getattr(c, "role", None)
-            if role_str is None:
-                # Fallback: infer from name (temporary during migration)
-                name_lower = c.name.lower()
-                if "critic" in name_lower:
-                    role = AgentRole.CRITIC
-                elif "evidence" in name_lower or "verifier" in name_lower:
-                    role = AgentRole.EVIDENCE_VERIFIER
-                elif "devil" in name_lower:
-                    role = AgentRole.DEVILS_ADVOCATE
-                elif "alternative" in name_lower or "alt" in name_lower:
-                    role = AgentRole.ALTERNATIVE_SOLVER
-                else:
-                    role = AgentRole.SOLVER
-            else:
-                role = AgentRole(role_str) if isinstance(role_str, str) else role_str
+            role = AgentRole(c.role)
 
             cfg = AgentConfig(
                 name=c.name,
@@ -133,11 +185,11 @@ class PolicyEngine:
                 result.synthesizer_config = cfg
 
         if not result.solver_configs:
+            # No solvers configured — treat all candidates as solvers
             for c in self.settings.candidates:
-                role = AgentRole.SOLVER
                 cfg = AgentConfig(
                     name=c.name,
-                    role=role,
+                    role=AgentRole.SOLVER,
                     model=c.model,
                     system_prompt=c.system_prompt,
                     temperature=c.temperature,
