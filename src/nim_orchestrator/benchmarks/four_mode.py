@@ -97,6 +97,7 @@ class TrialOutcome:
     alternates_used: int = 0
     sandbox_invocations: int = 0
     budget_exhausted: bool = False
+    deployments: list[dict] = field(default_factory=list)  # provider provenance
     raw_trace: list[str] = field(default_factory=list)
     verification_records: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
@@ -116,6 +117,7 @@ class TrialOutcome:
             "alternates_used": self.alternates_used,
             "sandbox_invocations": self.sandbox_invocations,
             "budget_exhausted": self.budget_exhausted,
+            "deployments": self.deployments,
             "raw_trace": self.raw_trace,
             "verification_records": self.verification_records,
             "metadata": self.metadata,
@@ -187,6 +189,7 @@ def environment_info(settings: Settings) -> dict:
         "platform": platform.platform(),
         "sandbox_backend": backend.name if backend else "none (fail-closed)",
         "models": [c.model for c in settings.candidates],
+        "primary_model": settings.primary_model,
         "judge_model": settings.judge.model if settings.judge else None,
         "router_base_url": settings.router_base_url,
     }
@@ -516,6 +519,19 @@ async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: 
         budget_exhausted = any("budget exhausted" in t.lower() for t in trace)
         alternates = sum(1 for t in trace if "alternate" in t.lower() and "attempt" in t.lower())
         sandbox_invocations = sandbox_run_count() - sandbox_before
+        # provider/deployment provenance per call — requested vs actual,
+        # key id (safe) only, never the API key
+        deployments = []
+        for entry in call_log:
+            if entry.get("deployment_id"):
+                deployments.append({
+                    "requested_model": entry.get("requested_model", ""),
+                    "response_model": entry.get("response_model", ""),
+                    "deployment_id": entry.get("deployment_id", ""),
+                    "provider": entry.get("provider", ""),
+                    "key_id_safe": entry.get("key_id_safe", ""),
+                    "status": entry.get("status", ""),
+                })
 
         return TrialOutcome(
             trial_id=trial_id(case["id"], mode, repeat),
@@ -533,6 +549,7 @@ async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: 
             alternates_used=alternates,
             sandbox_invocations=sandbox_invocations,
             budget_exhausted=budget_exhausted,
+            deployments=deployments,
             raw_trace=trace,
             verification_records=scored["records"],
         )

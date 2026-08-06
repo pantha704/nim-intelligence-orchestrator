@@ -140,7 +140,7 @@ class PolicyEngine:
                 client,
                 ctx,
                 agent_name="single",
-                model=self.settings.task_compiler.model,
+                model=self.settings.primary_model,
                 messages=[{"role": "user", "content": ctx.raw_prompt}],
                 temperature=0.2,
                 max_tokens=256,
@@ -165,7 +165,7 @@ class PolicyEngine:
 
         spec = await speculative_route(
             client,
-            model=self.settings.task_compiler.model,
+            model=self.settings.primary_model,
             prompt=ctx.raw_prompt,
             max_quick_tokens=256,
             ctx=ctx,

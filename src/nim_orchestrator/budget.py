@@ -88,18 +88,26 @@ class ExecutionBudget:
             return len(self._call_log) - 1
 
     def complete_call(
-        self, token: int, latency_ms: float, tokens: int = 0, status: str = "success"
+        self, token: int, latency_ms: float, tokens: int = 0, status: str = "success",
+        deployment: dict | None = None,
     ) -> None:
         """Record the outcome of a reserved call.
 
         Failed attempts still consume the budget — model_calls was already
-        incremented at reservation time.
+        incremented at reservation time. Deployment provenance (requested vs
+        actual model, provider, key id) is recorded when provided; the raw
+        API key is never stored.
         """
         if 0 <= token < len(self._call_log):
             entry = self._call_log[token]
             entry["latency_ms"] = round(latency_ms, 1)
             entry["tokens"] = tokens
             entry["status"] = status
+            if deployment:
+                for key in ("requested_model", "response_model", "deployment_id", "provider", "key_id_safe"):
+                    value = deployment.get(key)
+                    if value:
+                        entry[key] = value
 
     def record_call(self, agent_name: str, model: str, latency_ms: float, tokens: int = 0) -> None:
         """Legacy non-atomic recorder (kept for compatibility/tests)."""

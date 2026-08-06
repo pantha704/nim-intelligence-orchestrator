@@ -61,6 +61,9 @@ class Settings(BaseModel):
     router_api_key: str = ""
     orchestrator_host: str = "127.0.0.1"
     orchestrator_port: int = 4010
+    # primary model for direct/speculative quick calls (distinct responsibility
+    # from the task compiler's model)
+    primary_model: str = "deepseek-v4-flash"
     candidates: list[CandidateConfig] = Field(default_factory=list)
     judge: JudgeConfig | None = None
     synthesizer: SynthesizerConfig | None = None
@@ -143,12 +146,14 @@ def load_settings() -> Settings:
     difficulty = DifficultyRouterConfig(**difficulty_data) if difficulty_data else DifficultyRouterConfig()
     dag = DagConfig(**dag_data) if dag_data else DagConfig()
     task_compiler = TaskCompilerConfig(**task_compiler_data) if task_compiler_data else TaskCompilerConfig()
+    primary_model = raw.get("primary_model", "deepseek-v4-flash") if yaml_path.exists() else "deepseek-v4-flash"
 
     return Settings(
         router_base_url=base_url,
         router_api_key=api_key,
         orchestrator_host=host,
         orchestrator_port=port,
+        primary_model=primary_model,
         candidates=candidates,
         judge=judge,
         synthesizer=synthesizer,

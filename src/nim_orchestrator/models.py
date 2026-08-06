@@ -128,7 +128,7 @@ class ModelRegistry:
             info.latency_ms_history.append(max(latency_ms, 0.0))
             info.error_count = 0
             info.health = "healthy"
-        elif status in ("timeout", "error"):
+        elif status in ("timeout", "error", "empty_response"):
             info.error_count += 1
             if info.error_count >= 2:
                 info.health = "down"

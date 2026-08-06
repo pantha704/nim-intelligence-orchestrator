@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, field
 
 from .agents import AgentConfig, AgentRole
+from .boundaries import wrap_data_block
 from .clustering import Candidate
 from .config import DagConfig
 from .context import RunContext
@@ -307,22 +308,6 @@ def build_dag(task_spec: TaskSpec) -> list[DAGNode]:
 # ============================================================
 # Execution
 # ============================================================
-
-
-def wrap_data_block(payload: dict, note: str = "") -> str:
-    """Serialize untrusted content as non-escapable, nonce-delimited JSON.
-
-    The delimiter carries a per-request random nonce, so attacker content
-    containing '[END NIM DATA ...]' cannot prematurely close the boundary,
-    and JSON escaping prevents structure injection.
-    """
-    import json
-    import secrets
-
-    nonce = secrets.token_hex(16)
-    body = json.dumps(payload, ensure_ascii=False)
-    block = f"[BEGIN NIM DATA {nonce}]\n{body}\n[END NIM DATA {nonce}]"
-    return f"{block}\n{note}".strip()
 
 
 def _node_prompt(node: DAGNode, context_text: str) -> str:

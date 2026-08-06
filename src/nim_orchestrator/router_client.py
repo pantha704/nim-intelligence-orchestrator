@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -15,10 +16,38 @@ class ChatResult:
     raw: dict = field(default_factory=dict)
     finish_reason: str = ""
     tokens_generated: int = 0
+    # provider/deployment provenance (never the API key itself)
+    requested_model: str = ""
+    response_model: str = ""
+    deployment_id: str = ""
+    provider: str = ""
+    key_id_safe: str = ""
 
     @property
     def ok(self) -> bool:
         return bool(self.content)
+
+    def deployment(self) -> dict:
+        return {
+            "requested_model": self.requested_model,
+            "response_model": self.response_model,
+            "deployment_id": self.deployment_id,
+            "provider": self.provider,
+            "key_id_safe": self.key_id_safe,
+        }
+
+
+def parse_deployment_id(deployment_id: str) -> dict:
+    """Derive provider + key index from a deployment id.
+
+    deepseek-v4-flash-go-key-1      -> provider=go,  key=1
+    deepseek-v4-flash-auto-nim-key-2 -> provider=nim, key=2
+    Never contains the API key.
+    """
+    m = re.search(r"-(?:auto-)?(nim|go)-key-(\d+)$", deployment_id)
+    if m:
+        return {"provider": m.group(1), "key_id_safe": f"{m.group(1)}-key-{m.group(2)}"}
+    return {"provider": "unknown", "key_id_safe": ""}
 
 
 @dataclass
@@ -57,23 +86,39 @@ RETRYABLE_STATUS = {429, 529, 502, 503}
 from .budget import BudgetExhaustedError  # noqa: F401 — re-exported for existing importers
 
 
+class EmptyResponseError(Exception):
+    """Raised when a model call returned empty content — an empty completion
+    is a failed call, never a success, and must be retried/failed over."""
+
+
 async def budgeted_call(ctx, *, agent_name: str, model: str, call_fn, timeout: float = 30):
     """Run call_fn under ExecutionBudget enforcement.
 
     Reservation happens BEFORE the network request (atomic under the budget
     lock); the concurrency semaphore only bounds active in-flight calls.
-    All outcomes — success, timeout, transport/HTTP error, cancelled — are
-    recorded in the call log and consume the reserved budget slot.
+    All outcomes — success, empty_response, timeout, transport/HTTP error,
+    cancelled — are recorded in the call log and consume the reserved slot.
     """
     token = await ctx.budget.reserve_call(agent_name, model)
     try:
         async with ctx.budget.semaphore:
             result = await asyncio.wait_for(call_fn(), timeout=timeout)
+        deployment = getattr(result, "deployment", dict)() or {}
+        if getattr(result, "ok", True) is False:
+            ctx.budget.complete_call(
+                token, getattr(result, "latency_ms", 0) or 0, 0,
+                status="empty_response", deployment=deployment,
+            )
+            raise EmptyResponseError(
+                f"empty response from model '{getattr(result, 'requested_model', model)}' "
+                f"(deployment {getattr(result, 'deployment_id', 'unknown')})"
+            )
         ctx.budget.complete_call(
             token,
             getattr(result, "latency_ms", 0) or 0,
             getattr(result, "tokens_generated", 0) or 0,
             status="success",
+            deployment=deployment,
         )
         return result
     except TimeoutError:
@@ -82,6 +127,8 @@ async def budgeted_call(ctx, *, agent_name: str, model: str, call_fn, timeout: f
     except asyncio.CancelledError:
         ctx.budget.complete_call(token, 0, 0, status="cancelled")
         raise
+    except EmptyResponseError:
+        raise  # status already recorded as empty_response
     except Exception:
         ctx.budget.complete_call(token, 0, 0, status="error")
         raise
@@ -197,6 +244,9 @@ class RouterClient:
             raw=data,
             finish_reason=choice.get("finish_reason", ""),
             tokens_generated=data.get("usage", {}).get("completion_tokens", 0),
+            requested_model=model,
+            response_model=data.get("model", ""),
+            **self._deployment_from_headers(resp.headers),
         )
 
     async def _chat_stream(
@@ -272,7 +322,24 @@ class RouterClient:
             raw={},
             finish_reason=finish_reason,
             tokens_generated=len(content) // 4,
+            requested_model=model,
+            response_model=model,
+            **self._deployment_from_headers(resp.headers),
         )
+
+    def _deployment_from_headers(self, headers) -> dict:
+        """Capture provider/deployment provenance from response headers.
+
+        LiteLLM sets x-litellm-model-id (deployment id). The API key itself
+        is never captured or stored.
+        """
+        deployment_id = headers.get("x-litellm-model-id", "") if hasattr(headers, "get") else ""
+        parsed = parse_deployment_id(deployment_id)
+        return {
+            "deployment_id": deployment_id,
+            "provider": parsed["provider"],
+            "key_id_safe": parsed["key_id_safe"],
+        }
 
     async def chat_batch(
         self,
