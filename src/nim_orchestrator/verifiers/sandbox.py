@@ -22,8 +22,9 @@ from dataclasses import dataclass
 
 ALLOWED_LANGUAGES = ("python", "py")
 
-DOCKER_IMAGE = "python:3.11-slim"
-_BACKEND_ORDER: list[str] = ["bubblewrap", "docker"]
+# Pinned by digest for reproducibility — never resolved at request time.
+DOCKER_IMAGE = "python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7"
+_BACKEND_ORDER: list[str] = ["docker", "bubblewrap"]
 
 
 @dataclass
@@ -199,20 +200,43 @@ class HostSubprocessBackend(SandboxBackend):
 
 
 class BubblewrapBackend(SandboxBackend):
-    """Bubblewrap: read-only root, writable workdir, network namespace off."""
+    """Bubblewrap with a MINIMAL filesystem namespace: only the Python
+    runtime directories and the isolated workdir are visible. The host root
+    is never mounted — /home, the repository, /etc and secrets stay
+    invisible."""
 
     name = "bubblewrap"
+
+    @staticmethod
+    def _runtime_binds() -> list[str]:
+        """Binds for the python runtime only: the interpreter's own prefix,
+        the system loader/libs and ld.so.cache. Nothing else."""
+        real = os.path.realpath(sys.executable)
+        prefix = os.path.dirname(os.path.dirname(real))  # .../cpython-3.11.15/
+        binds: list[str] = []
+        for src in (prefix, "/usr", "/lib", "/lib64", "/bin", "/sbin"):
+            if os.path.isdir(src):
+                binds.extend(["--ro-bind", src, src])
+        for src in ("/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/nsswitch.conf"):
+            if os.path.isfile(src):
+                binds.extend(["--ro-bind", src, src])
+        return binds
 
     def available(self) -> bool:
         if shutil.which("bwrap") is None:
             return False
         try:
-            probe = subprocess.run(
-                ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-                 "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid", "true"],
-                capture_output=True, timeout=10, check=False,
-            )
-            return probe.returncode == 0
+            # Probe a REAL python run inside the minimal namespace, not `true`
+            with tempfile.TemporaryDirectory(prefix="nim-bwrap-probe-") as td:
+                probe = subprocess.run(
+                    ["bwrap", *self._runtime_binds(),
+                     "--bind", td, td,
+                     "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+                     "--unshare-net", "--unshare-pid",
+                     "--", sys.executable, "-I", "-S", "-c", "print(1)"],
+                    cwd=td, capture_output=True, timeout=15, check=False,
+                )
+                return probe.returncode == 0 and probe.stdout.strip() == b"1"
         except Exception:
             return False
 
@@ -228,12 +252,12 @@ class BubblewrapBackend(SandboxBackend):
 
         cmd = [
             "bwrap",
-            "--ro-bind", "/", "/",          # read-only root filesystem
-            "--bind", workdir, workdir,     # empty writable work directory
+            *self._runtime_binds(),      # minimal rootfs: python runtime + loader
+            "--bind", workdir, workdir,  # empty writable work directory
             "--dev", "/dev",
             "--proc", "/proc",
             "--tmpfs", "/tmp",
-            "--unshare-net",                # network namespace disabled
+            "--unshare-net",             # network namespace disabled
             "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--die-with-parent",
             "--new-session",
@@ -282,6 +306,9 @@ class BubblewrapBackend(SandboxBackend):
 
 @functools.lru_cache(maxsize=1)
 def _docker_available() -> bool:
+    """Docker is available only when the daemon runs AND the PINNED image is
+    already present. The sandbox never pulls images during a request — use
+    scripts/sandbox_setup.sh as the explicit preflight."""
     try:
         info = subprocess.run(["docker", "info"], capture_output=True, timeout=10, check=False)
         if info.returncode != 0:
@@ -289,10 +316,7 @@ def _docker_available() -> bool:
         inspect = subprocess.run(
             ["docker", "image", "inspect", DOCKER_IMAGE], capture_output=True, timeout=10, check=False
         )
-        if inspect.returncode == 0:
-            return True
-        pull = subprocess.run(["docker", "pull", DOCKER_IMAGE], capture_output=True, timeout=120, check=False)
-        return pull.returncode == 0
+        return inspect.returncode == 0
     except Exception:
         return False
 
@@ -368,12 +392,14 @@ class DockerBackend(SandboxBackend):
         )
 
 
-_SECURE_BACKENDS = [BubblewrapBackend(), DockerBackend()]
+_SECURE_BACKENDS = [DockerBackend(), BubblewrapBackend()]  # docker preferred
 
 
 @functools.lru_cache(maxsize=1)
 def select_secure_backend() -> SandboxBackend | None:
-    """Pick the first available secure backend. Never returns an unsafe one."""
+    """Pick the first available secure backend. Docker is preferred (strongest
+    isolation); Bubblewrap runs with a minimal rootfs. Never returns an
+    unsafe one."""
     for b in _SECURE_BACKENDS:
         if b.available():
             return b
@@ -416,3 +442,17 @@ def run_secure_sandbox(
         max_processes=max_processes,
         allow_network=allow_network,
     )
+
+
+if __name__ == "__main__":
+    """Preflight: report backend status. Run via scripts/sandbox_setup.sh."""
+    backend = select_secure_backend()
+    if backend is None:
+        print("sandbox backend: NONE — secure execution fails closed")
+        print("docker:", _docker_available(), "| bubblewrap:", BubblewrapBackend().available())
+    else:
+        print(f"sandbox backend: {backend.name} (isolation={backend.isolation_level()})")
+        r = run_secure_sandbox("print('preflight-ok')")
+        print(f"probe: status={r.status} stdout={r.stdout.strip()!r}")
+        if not r.ok:
+            raise SystemExit(1)

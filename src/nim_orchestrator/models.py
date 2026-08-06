@@ -33,6 +33,14 @@ DEFAULT_CAPABILITIES: dict[str, list[str]] = {
     "minimax-3": ["long_context", "research"],
 }
 
+# Explicit aliases only — never derived from capabilities
+DEFAULT_ALIASES: dict[str, list[str]] = {
+    "deepseek-v4-flash": ["flash"],
+    "deepseek-v4-pro": ["pro"],
+    "glm-5.2": ["glm"],
+    "minimax-3": ["minimax"],
+}
+
 
 @dataclass
 class ModelInfo:
@@ -52,11 +60,18 @@ class ModelInfo:
 
 
 class ModelRegistry:
-    """Scores configured models for a specialist; never picks alphabetically."""
+    """Scores configured models for a specialist; never picks alphabetically.
+
+    health_scope records whether health values are model-specific ("model"),
+    derived from a global router probe ("global"), or not yet known
+    ("unknown"). Live outcomes (record_outcome) always refine model-specific
+    state.
+    """
 
     def __init__(self):
         self._models: dict[str, ModelInfo] = {}
         self._order: list[str] = []
+        self.health_scope: str = "unknown"
 
     def register(self, name: str, aliases: list[str] | None = None,
                  capabilities: list[str] | None = None, health: str = "unknown",
@@ -65,8 +80,8 @@ class ModelRegistry:
             return
         self._models[name] = ModelInfo(
             name=name,
-            aliases=aliases or DEFAULT_CAPABILITIES.get(name, []),
-            capabilities=capabilities or DEFAULT_CAPABILITIES.get(name, []),
+            aliases=list(aliases) if aliases is not None else list(DEFAULT_ALIASES.get(name, [])),
+            capabilities=list(capabilities) if capabilities is not None else list(DEFAULT_CAPABILITIES.get(name, [])),
             health=health,
             suitability=suitability or DEFAULT_SUITABILITY.get(name, {s: 0.5 for s in SPECIALIST_NAMES}),
         )
@@ -89,6 +104,7 @@ class ModelRegistry:
     def set_health(self, name: str, health: str) -> None:
         if name in self._models:
             self._models[name].health = health
+            self.health_scope = "model"
 
     def record_latency(self, name: str, latency_ms: float) -> None:
         if name in self._models:
@@ -103,6 +119,7 @@ class ModelRegistry:
 
         success → latency history recorded, health restored;
         timeout/error → error_count grows: degraded after 1, down after 2.
+        Outcomes are model-specific (scope becomes "model").
         """
         info = self._models.get(name)
         if info is None:
@@ -117,11 +134,17 @@ class ModelRegistry:
                 info.health = "down"
             elif info.error_count >= 1:
                 info.health = "degraded"
+        self.health_scope = "model"
 
     def mark_router_unreachable(self) -> None:
-        """Router health probe failed — every model becomes degraded."""
+        """Global router health probe failed — every model becomes degraded.
+
+        This is ROUTER-GLOBAL, not model-specific: the scope is labeled
+        "global" and no per-model claims are made.
+        """
         for name in self._order:
             self._models[name].health = "degraded"
+        self.health_scope = "global"
 
     def select(self, specialist_name: str, preferred: list[str] | None = None) -> str | None:
         """Pick the best model for a specialist by suitability, preference,

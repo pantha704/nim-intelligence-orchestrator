@@ -215,40 +215,41 @@ def _make_test_runner_verifier(tools: ToolRegistry):
         blocks = _extract_python_blocks(answer)
         if not blocks:
             return "unverified", "no code blocks to test", ""
-        tests = [code for code in blocks if "def test_" in code]
-        if not tests:
+        if not any("def test_" in code for code in blocks):
             return "unverified", "no test_* functions found — nothing was tested", ""
 
-        n = len(tests)
+        # EVERY Python block is written into the sandbox — implementation and
+        # test blocks alike. They load into ONE shared namespace in order, so
+        # tests can call the implementation from other blocks. Tests are
+        # discovered only after all modules load.
+        n = len(blocks)
         lines = [
             "collected = passed = failed = 0",
             "failures = []",
+            "import_failures = []",
         ]
         for i in range(n):
             lines.extend([
-                f"ns_{i} = {{}}",
                 "try:",
-                f"    exec(open('block{i}.py').read(), ns_{i})",
+                f"    exec(open('block{i}.py').read(), ns)",
                 "except Exception as e:",
-                f"    print('IMPORT_FAIL', {i}, repr(e))",
-            ])
-        for i in range(n):
-            lines.extend([
-                f"for name, obj in sorted(ns_{i}.items()):",
-                "    if name.startswith('test_') and callable(obj):",
-                "        collected += 1",
-                "        try:",
-                "            obj(); passed += 1",
-                "        except Exception as e:",
-                "            failed += 1; failures.append(f'{name}: {e!r}')",
+                f"    import_failures.append(({i}, repr(e)))",
             ])
         lines.extend([
+            "for name, obj in sorted(ns.items()):",
+            "    if name.startswith('test_') and callable(obj):",
+            "        collected += 1",
+            "        try:",
+            "            obj(); passed += 1",
+            "        except Exception as e:",
+            "            failed += 1; failures.append(f'{name}: {e!r}')",
             "print('COLLECTED', collected, 'PASSED', passed, 'FAILED', failed)",
+            "print('IMPORT_FAILURES', import_failures)",
             "print('FAILURES', failures)",
         ])
-        runner = "\n".join(lines)
+        runner = "ns = {}\n" + "\n".join(lines)
 
-        files = {f"block{i}.py": code for i, code in enumerate(tests)}
+        files = {f"block{i}.py": code for i, code in enumerate(blocks)}
         r = tools.call("sandbox", code=runner, files=files, timeout_seconds=timeout_seconds)
         if r.status == "unavailable":
             raise ToolUnavailableError(r.error)
@@ -261,10 +262,11 @@ def _make_test_runner_verifier(tools: ToolRegistry):
         if not m:
             return "fail", f"test runner produced no summary: {r.stdout[:200]}", ""
         collected, passed, failed = (int(v) for v in m.groups())
+        # Import/setup failures are FAIL — never a misleading zero-test result
+        if "IMPORT_FAILURES []" not in r.stdout:
+            return "fail", "test module(s) failed to import", r.stdout.strip()[:300]
         if collected == 0:
             return "unverified", "no test_* callables discovered — nothing was tested", ""
-        if "IMPORT_FAIL" in r.stdout:
-            return "fail", "test module failed to import", r.stdout.strip()[:300]
         if failed > 0:
             return "fail", f"{failed}/{collected} tests failed", r.stdout.strip()[:300]
         return "pass", f"{passed}/{collected} tests passed", r.stdout.strip()[:300]

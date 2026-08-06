@@ -321,7 +321,8 @@ class TestDependencySemantics:
         s2_msgs = None
         for msgs in client.messages:
             user = msgs[1]["content"] if len(msgs) > 1 else ""
-            if "Compute output from input" in user and "Acceptance criteria:" in user:
+            # node prompts carry the JSON 'objective' key (the synthesizer does not)
+            if '"objective": "Compute output from input"' in user and "[BEGIN NIM DATA" in user:
                 s2_msgs = user
         assert s2_msgs is not None
         assert "--- s1 ---" in s2_msgs
