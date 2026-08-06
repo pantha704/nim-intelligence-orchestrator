@@ -29,6 +29,7 @@ from .clustering import Candidate
 from .config import DagConfig
 from .context import RunContext
 from .router_client import RouterClient, budgeted_call
+from .specialists import Specialist
 from .task_compiler import TaskSpec
 from .verifiers.external_checks import VerificationReport, verify_answer
 
@@ -59,6 +60,8 @@ class DAGNode:
     acceptance: list[AcceptanceResult] = field(default_factory=list)
     status: str = "pending"  # verified_pass | partial | unverified | failed | blocked
     risk_level: str = "medium"
+    specialist: str = ""
+    model: str = ""
     attempts: int = 0
     alternates_used: int = 0
     error: str = ""
@@ -358,19 +361,55 @@ async def execute_node(
     - failed → run one alternate (max 1)
     - unverified/partial → run an alternate only for medium/high-risk nodes
     - verified_pass → stop
+
+    When dag_cfg.specialists_enabled, agents are built from the specialist
+    registry (capability model + prompt + verifier); the alternate is a
+    different specialist (general reasoning) when the primary is specialized.
     """
     node.risk_level = risk_level
-    solvers = ctx.policy.solver_configs
-    primary = solvers[0] if solvers else AgentConfig(
-        name="solver", role=AgentRole.SOLVER, model=dag_cfg.primary_model,
-        system_prompt="You are a precise problem solver. Solve the objective rigorously.",
-        timeout_seconds=dag_cfg.timeout_seconds,
-    )
-    alternates = solvers[1:] or []
 
-    attempts_left = 1 + min(dag_cfg.max_alternates, len(alternates))
+    configs: list[AgentConfig]
+    if dag_cfg.specialists_enabled:
+        from .specialists import SPECIALISTS, assign_specialist, available_models
+
+        spec = assign_specialist(f"{node.objective} {node.acceptance_criteria}")
+        node.specialist = spec.name
+        configured = {c.model for c in ctx.policy.solver_configs}
+        if not configured:
+            configured = {dag_cfg.primary_model}
+        models = available_models(spec, configured)
+        node.model = models[0]
+
+        def _specialist_agent(s: Specialist) -> AgentConfig:
+            return AgentConfig(
+                name=f"{s.name}:{node.id}",
+                role=AgentRole.SOLVER,
+                model=available_models(s, configured)[0],
+                system_prompt=s.system_prompt,
+                temperature=0.3,
+                reasoning_effort="none",
+                max_tokens=1024,
+                timeout_seconds=s.timeout_seconds,
+            )
+
+        configs = [_specialist_agent(spec)]
+        alternate_spec = SPECIALISTS["general_reasoning"]
+        if alternate_spec is not spec and dag_cfg.max_alternates > 0:
+            configs.append(_specialist_agent(alternate_spec))
+        configs = configs[: 1 + dag_cfg.max_alternates]
+    else:
+        solvers = ctx.policy.solver_configs
+        if not solvers:
+            solvers = [AgentConfig(
+                name="solver", role=AgentRole.SOLVER, model=dag_cfg.primary_model,
+                system_prompt="You are a precise problem solver. Solve the objective rigorously.",
+                timeout_seconds=dag_cfg.timeout_seconds,
+            )]
+        configs = list(solvers[: 1 + dag_cfg.max_alternates])
+
+    attempts_left = len(configs)
     attempt_label = "primary"
-    cfg = primary
+    cfg = configs[0]
 
     while attempts_left > 0:
         attempts_left -= 1
@@ -390,7 +429,8 @@ async def execute_node(
             node.status = node_status(answer_report, node.acceptance, node.objective, " ".join(criteria))
             ctx.add_trace(
                 f"DAG node {node.id} attempt {attempt_label}: {node.status} "
-                f"({answer_report.status}, {len(answer_report.results)} checks)"
+                f"(specialist={node.specialist or 'default'}, model={cfg.model}, "
+                f"{answer_report.status}, {len(answer_report.results)} checks)"
             )
             if node.status == "failed":
                 node.error = "; ".join(answer_report.failures) or "acceptance criteria failed"
@@ -403,7 +443,7 @@ async def execute_node(
         )
         if attempts_left > 0 and should_retry:
             attempt_label = "alternate"
-            cfg = alternates[min(node.alternates_used, len(alternates) - 1)]
+            cfg = configs[min(node.alternates_used + 1, len(configs) - 1)]
             node.alternates_used += 1
         else:
             return

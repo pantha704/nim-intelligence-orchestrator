@@ -148,3 +148,6 @@ dag:
   max_alternates: 1
   primary_model: deepseek-v4-flash
   timeout_seconds: 30
+  # Phase 4.1: capability-based specialist registry (model + prompt + verifier).
+  # Off by default so Phase 4.3 can benchmark DAG with vs without specialists.
+  specialists_enabled: false

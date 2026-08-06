@@ -46,6 +46,7 @@ class DagConfig(BaseModel):
     max_alternates: int = 1
     primary_model: str = "deepseek-v4-flash"
     timeout_seconds: int = 30
+    specialists_enabled: bool = False
 
 
 class DifficultyRouterConfig(BaseModel):
