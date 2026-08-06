@@ -191,6 +191,29 @@ class TestBudgetEnforcement:
         assert ctx.budget.model_calls == 1
         assert not ctx.budget.can_call()
 
+    async def test_bypass_escalation_carries_agent_configs(self):
+        """Regression: bypass decisions must include solver/reviewer configs so
+        escalation to the full pipeline can actually run."""
+        from nim_orchestrator.policy import PolicyEngine
+
+        settings = _pipeline_settings()
+        engine = PolicyEngine(settings)
+        ctx = RunContext(raw_prompt="What is the capital of France?")
+        ctx.budget = ExecutionBudget(limits=BudgetLimits(max_model_calls=0))
+        ctx.start()
+        ctx.policy = engine.decide(ctx.raw_prompt)
+
+        assert ctx.policy.action == "speculative"
+        assert len(ctx.policy.solver_configs) >= 2
+        assert len(ctx.policy.reviewer_configs) >= 3
+
+        # Escalation path must be executable: speculative blocked by budget,
+        # then the full pipeline can still run with populated agents.
+        client = MockPipelineClient()
+        accepted = await engine.execute_speculative(ctx, client)
+        assert accepted is False
+        assert len(ctx.policy.solver_configs) > 0
+
 
 # ============================================================
 # 3. Single task classifier

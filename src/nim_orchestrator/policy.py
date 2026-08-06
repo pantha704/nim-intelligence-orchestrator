@@ -84,6 +84,8 @@ class PolicyEngine:
             result.should_speculate = True
             result.should_run_full_pipeline = False
             result.reason = "compiler bypassed — simple query"
+            # Populate agents so escalation to the full pipeline can still run
+            self._populate_agents(result)
             return result
 
         # Use TaskSpec route if available, otherwise classify
