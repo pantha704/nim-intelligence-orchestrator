@@ -1,9 +1,9 @@
-"""Phase 4.1 — Specialist registry.
+"""Phase 4.1/4.2 — Specialist registry.
 
 Capability-based specialists: model + context + tools + verifier, not merely
 a persona prompt. Each specialist declares its preferred models, system
-prompt, available tools, timeout, verification method and known
-strengths/weaknesses.
+prompt, available tools (registered ToolRegistry IDs), timeout, verification
+method (registered VerifierRegistry ID) and known strengths/weaknesses.
 
 Used by the adaptive DAG to assign a specialist to every node. Disabled by
 default — Phase 4.3 benchmarks compare DAG with and without specialists.
@@ -26,9 +26,9 @@ class Specialist:
     label: str
     preferred_models: list[str]
     system_prompt: str
-    available_tools: list[str] = field(default_factory=list)
+    available_tools: list[str] = field(default_factory=list)  # registered tool IDs
     timeout_seconds: int = 30
-    verification_method: str = "none"  # arithmetic | python_syntax | safety | none
+    verification_method: str = "none"  # registered verifier ID
     strengths: list[str] = field(default_factory=list)
     weaknesses: list[str] = field(default_factory=list)
 
@@ -56,7 +56,7 @@ SPECIALISTS: dict[str, Specialist] = {
             "explain the algorithm; state assumptions about inputs. Include runnable code "
             "blocks in your answer when code is expected."
         ),
-        available_tools=["python_executor (disabled until sandbox)", "python_syntax_checker"],
+        available_tools=["sandbox", "test_runner", "python_syntax"],
         timeout_seconds=30,
         verification_method="python_syntax",
         strengths=["code generation", "algorithm implementation", "debugging"],
@@ -72,9 +72,9 @@ SPECIALISTS: dict[str, Specialist] = {
             "equations (e.g. '17 * 23 = 391') so they can be machine-verified. "
             "For proofs, state each step and its justification."
         ),
-        available_tools=["arithmetic_verifier"],
+        available_tools=["math_evaluator"],
         timeout_seconds=30,
-        verification_method="arithmetic",
+        verification_method="math_semantic",
         strengths=["arithmetic", "algebra", "step-by-step proofs"],
         weaknesses=["non-quantitative claims", "hand-waving derivations"],
     ),
@@ -88,9 +88,9 @@ SPECIALISTS: dict[str, Specialist] = {
             "interpretation; flag anything you cannot verify; prefer precise, "
             "attributable claims over vague summaries."
         ),
-        available_tools=["citation_checker (not yet implemented)"],
+        available_tools=["claim_extractor", "citation_source"],
         timeout_seconds=30,
-        verification_method="none",
+        verification_method="claim_extraction",
         strengths=["factual synthesis", "comparisons", "source-aware claims"],
         weaknesses=["unverifiable claims", "recency gaps"],
     ),
@@ -105,9 +105,9 @@ SPECIALISTS: dict[str, Specialist] = {
             "and failure modes. Prefer concrete component diagrams in text over "
             "vague principles."
         ),
-        available_tools=[],
+        available_tools=["coverage_checker"],
         timeout_seconds=30,
-        verification_method="none",
+        verification_method="coverage",
         strengths=["distributed systems", "trade-off analysis", "capacity planning"],
         weaknesses=["implementation detail", "benchmark numbers without sources"],
     ),
@@ -121,9 +121,9 @@ SPECIALISTS: dict[str, Specialist] = {
             "models and mitigations. Never produce exploit instructions; always pair "
             "findings with remediation. Be specific about attack surfaces."
         ),
-        available_tools=["safety_verifier"],
+        available_tools=["security_checklist"],
         timeout_seconds=30,
-        verification_method="safety",
+        verification_method="security_checklist",
         strengths=["vulnerability analysis", "threat modeling", "remediation"],
         weaknesses=["greenfield design", "non-security requirements"],
     ),
@@ -145,11 +145,23 @@ SPECIALISTS: dict[str, Specialist] = {
     ),
 }
 
+# Registered verifier IDs (must exist in verifiers.registry.VerifierRegistry)
+VALID_VERIFIER_IDS = {
+    "python_syntax", "code_sandbox", "test_runner", "math_semantic",
+    "claim_extraction", "security_checklist", "coverage", "safety", "none",
+}
+
+# Registered tool IDs (must exist in verifiers.registry.ToolRegistry)
+VALID_TOOL_IDS = {
+    "sandbox", "math_evaluator", "python_syntax", "test_runner",
+    "claim_extractor", "citation_source", "security_checklist", "coverage_checker",
+}
+
 
 def assign_specialist(text: str) -> Specialist:
     """Assign a specialist by capability keywords in the node objective/criteria.
 
-    Ordered rules: coding, mathematics, security_review, research,
+    Ordered rules: security_review, coding, mathematics, research,
     systems_architecture, then general_reasoning as the default.
     """
     low = text.lower()
@@ -174,7 +186,7 @@ def assign_specialist(text: str) -> Specialist:
 
 def available_models(specialist: Specialist, configured_models: set[str]) -> list[str]:
     """Preferred models that are actually configured; falls back to the first
-    configured model."""
+    configured model (registration order)."""
     matched = [m for m in specialist.preferred_models if m in configured_models]
     if matched:
         return matched

@@ -107,6 +107,15 @@ async def verify_python_syntax(answer: str) -> VerificationResult:
     )
 
 
+EQUALITY_PATTERNS = [
+    r"(-?\d+(?:\.\d+)?)\s*([+\-*/×÷])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+    r"(-?\d+(?:\.\d+)?)\s*\+\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+    r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+    r"(-?\d+(?:\.\d+)?)\s*[×*]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+    r"(-?\d+(?:\.\d+)?)\s*[÷/]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
+]
+
+
 async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
     """Parse arithmetic expressions and verify them by actual calculation.
 
@@ -118,15 +127,7 @@ async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
 
     expressions = []
 
-    equality_patterns = [
-        r"(-?\d+(?:\.\d+)?)\s*([+\-*/×÷])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
-        r"(-?\d+(?:\.\d+)?)\s*\+\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
-        r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
-        r"(-?\d+(?:\.\d+)?)\s*[×*]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
-        r"(-?\d+(?:\.\d+)?)\s*[÷/]\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)",
-    ]
-
-    for pattern in equality_patterns:
+    for pattern in EQUALITY_PATTERNS:
         for match in re.finditer(pattern, answer):
             groups = match.groups()
             if len(groups) == 4:
@@ -207,8 +208,9 @@ async def verify_arithmetic(answer: str, prompt: str) -> VerificationResult:
     )
 
 
-async def verify_safety(answer: str) -> VerificationResult:
-    """Check if the answer contains unsafe content."""
+def safety_scan(answer: str) -> VerificationResult:
+    """Synchronous safety scan — shared by the async verifier and the
+    specialist verifier registry (safe to call from event loops)."""
     lower = answer.lower()
 
     patterns = {
@@ -244,6 +246,11 @@ async def verify_safety(answer: str) -> VerificationResult:
         status="pass",
         details="no safety violations",
     )
+
+
+async def verify_safety(answer: str) -> VerificationResult:
+    """Check if the answer contains unsafe content."""
+    return safety_scan(answer)
 
 
 async def verify_answer(

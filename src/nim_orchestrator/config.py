@@ -47,6 +47,7 @@ class DagConfig(BaseModel):
     primary_model: str = "deepseek-v4-flash"
     timeout_seconds: int = 30
     specialists_enabled: bool = False
+    sandbox_enabled: bool = False
 
 
 class DifficultyRouterConfig(BaseModel):

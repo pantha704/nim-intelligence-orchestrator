@@ -51,7 +51,10 @@ class TestRegistry:
             assert spec.preferred_models, f"{spec.name} has no preferred models"
             assert spec.system_prompt, f"{spec.name} has no system prompt"
             assert spec.timeout_seconds > 0
-            assert spec.verification_method in ("arithmetic", "python_syntax", "safety", "none")
+            assert spec.verification_method in (
+                "math_semantic", "python_syntax", "claim_extraction",
+                "security_checklist", "coverage", "safety", "none",
+            )
             assert isinstance(spec.strengths, list)
             assert isinstance(spec.weaknesses, list)
 
