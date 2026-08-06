@@ -1,7 +1,16 @@
-"""Execution budget: tracks and enforces limits on model calls, time, and agents."""
+"""Execution budget: tracks and enforces limits on model calls, time, and agents.
+
+Reservation is atomic: reserve_call() checks and increments under an asyncio
+Lock, so concurrent agents cannot all observe the same unused call budget.
+The concurrency semaphore only limits active (in-flight) calls.
+"""
 import asyncio
 import time
 from dataclasses import dataclass, field
+
+
+class BudgetExhaustedError(Exception):
+    """Raised when the execution budget prevents another model call."""
 
 
 @dataclass
@@ -21,6 +30,7 @@ class ExecutionBudget:
     _start_time: float = 0.0
     _call_log: list[dict] = field(default_factory=list)
     _semaphore: asyncio.Semaphore | None = None
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def start(self) -> None:
         self._start_time = time.monotonic()
@@ -43,13 +53,63 @@ class ExecutionBudget:
         """True when no more model calls can be made."""
         return not self.can_call()
 
+    async def reserve_call(self, agent_name: str, model: str) -> int:
+        """Atomically reserve a model-call slot. Returns a reservation token.
+
+        Checks max_model_calls, max_total_agents and elapsed time, then
+        increments the reserved counters — all under a lock, so concurrent
+        reservations cannot overshoot the limits. Failed and timed-out calls
+        keep the reserved slot: the budget is consumed at reservation time,
+        not at completion.
+        """
+        async with self._lock:
+            if self.model_calls >= self.limits.max_model_calls:
+                raise BudgetExhaustedError(
+                    f"budget exhausted at {self.model_calls}/{self.limits.max_model_calls} "
+                    f"calls, {self.elapsed_seconds:.1f}s elapsed"
+                )
+            if self.agents_used >= self.limits.max_total_agents:
+                raise BudgetExhaustedError(
+                    f"agent budget exhausted — max {self.limits.max_total_agents} agents reached"
+                )
+            if self.elapsed_seconds >= self.limits.max_time_seconds:
+                raise BudgetExhaustedError(
+                    f"time budget exhausted at {self.elapsed_seconds:.1f}s"
+                )
+            self.model_calls += 1
+            self.agents_used += 1
+            self._call_log.append({
+                "agent": agent_name,
+                "model": model,
+                "latency_ms": None,
+                "tokens": None,
+                "status": "in_flight",
+            })
+            return len(self._call_log) - 1
+
+    def complete_call(
+        self, token: int, latency_ms: float, tokens: int = 0, status: str = "success"
+    ) -> None:
+        """Record the outcome of a reserved call.
+
+        Failed attempts still consume the budget — model_calls was already
+        incremented at reservation time.
+        """
+        if 0 <= token < len(self._call_log):
+            entry = self._call_log[token]
+            entry["latency_ms"] = round(latency_ms, 1)
+            entry["tokens"] = tokens
+            entry["status"] = status
+
     def record_call(self, agent_name: str, model: str, latency_ms: float, tokens: int = 0) -> None:
+        """Legacy non-atomic recorder (kept for compatibility/tests)."""
         self.model_calls += 1
         self._call_log.append({
             "agent": agent_name,
             "model": model,
             "latency_ms": round(latency_ms, 1),
             "tokens": tokens,
+            "status": "success",
         })
 
     def record_agent(self) -> None:

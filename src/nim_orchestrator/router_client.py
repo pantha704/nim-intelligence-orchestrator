@@ -54,9 +54,37 @@ def _should_early_stop(content: str, cfg: StreamConfig) -> bool:
 MAX_RETRIES = 3
 RETRYABLE_STATUS = {429, 529, 502, 503}
 
+from .budget import BudgetExhaustedError  # noqa: F401 — re-exported for existing importers
 
-class BudgetExhaustedError(Exception):
-    """Raised when the execution budget prevents another model call."""
+
+async def budgeted_call(ctx, *, agent_name: str, model: str, call_fn, timeout: float = 30):
+    """Run call_fn under ExecutionBudget enforcement.
+
+    Reservation happens BEFORE the network request (atomic under the budget
+    lock); the concurrency semaphore only bounds active in-flight calls.
+    All outcomes — success, timeout, transport/HTTP error, cancelled — are
+    recorded in the call log and consume the reserved budget slot.
+    """
+    token = await ctx.budget.reserve_call(agent_name, model)
+    try:
+        async with ctx.budget.semaphore:
+            result = await asyncio.wait_for(call_fn(), timeout=timeout)
+        ctx.budget.complete_call(
+            token,
+            getattr(result, "latency_ms", 0) or 0,
+            getattr(result, "tokens_generated", 0) or 0,
+            status="success",
+        )
+        return result
+    except TimeoutError:
+        ctx.budget.complete_call(token, 0, 0, status="timeout")
+        raise
+    except asyncio.CancelledError:
+        ctx.budget.complete_call(token, 0, 0, status="cancelled")
+        raise
+    except Exception:
+        ctx.budget.complete_call(token, 0, 0, status="error")
+        raise
 
 
 async def budgeted_chat(
@@ -70,37 +98,20 @@ async def budgeted_chat(
     max_tokens: int = 1024,
     timeout: float = 30,
 ):
-    """Chat call under ExecutionBudget enforcement.
+    """Chat call under ExecutionBudget enforcement (calls, time, concurrency)."""
 
-    - checks can_call() before calling (atomic under the concurrency semaphore)
-    - records each spawned agent
-    - enforces max_concurrent_agents via the budget semaphore
-    - records every call and latency
-    - raises BudgetExhaustedError when the budget is spent
-    """
-    async with ctx.budget.semaphore:
-        if not ctx.budget.can_call():
-            raise BudgetExhaustedError(
-                f"budget exhausted at {ctx.budget.model_calls}/{ctx.budget.limits.max_model_calls} "
-                f"calls, {ctx.budget.elapsed_seconds:.1f}s elapsed"
-            )
-        if not ctx.budget.can_spawn_agent():
-            raise BudgetExhaustedError(
-                f"agent budget exhausted — max {ctx.budget.limits.max_total_agents} agents reached"
-            )
-        ctx.budget.record_agent()
-        result = await asyncio.wait_for(
-            client.chat(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                max_tokens=max_tokens,
-            ),
-            timeout=timeout,
+    async def _call():
+        return await client.chat(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
         )
-        ctx.budget.record_call(agent_name, model, result.latency_ms, result.tokens_generated)
-        return result
+
+    return await budgeted_call(
+        ctx, agent_name=agent_name, model=model, call_fn=_call, timeout=timeout
+    )
 
 
 class RouterClient:

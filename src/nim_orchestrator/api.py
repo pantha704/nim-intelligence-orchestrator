@@ -51,34 +51,44 @@ async def handle_intelligence_request(
 
         task_result = bypass_task_spec(ctx.raw_prompt)
         ctx.add_trace("Compiler bypassed — obvious simple query")
-    elif ctx.budget.can_call():
-        task_result = await compile_task(
-            client,
-            model=settings.task_compiler.model,
-            raw_prompt=ctx.raw_prompt,
-            timeout_seconds=settings.task_compiler.timeout_seconds,
-        )
-        ctx.budget.record_call("task_compiler", settings.task_compiler.model, task_result.latency_ms)
-        ctx.add_trace(
-            f"Task compiled: route={task_result.task_spec.recommended_route}, risk={task_result.task_spec.risk_level}, "
-            f"subtasks={len(task_result.task_spec.subtasks)}, ambiguities={len(task_result.task_spec.ambiguities)} "
-            f"[{task_result.latency_ms:.0f}ms]"
-        )
     else:
-        task_result = TaskCompilerResult(
-            task_spec=TaskSpec(
-                objective=ctx.raw_prompt[:200],
-                context=ctx.raw_prompt,
-                recommended_route="complex",
-                risk_level="medium",
-                assumptions=["Budget exhausted — task compiler skipped"],
-            ),
-            needs_clarification=False,
-            clarification_question="",
-            raw_json="",
-            latency_ms=0,
-        )
-        ctx.add_trace("Budget exhausted — task compiler skipped, defaulting to complex route")
+        # The compiler is a model call: it reserves a slot on the shared
+        # execution budget through the same reservation path as every agent.
+        from .router_client import BudgetExhaustedError, budgeted_call
+
+        try:
+            task_result = await budgeted_call(
+                ctx,
+                agent_name="task_compiler",
+                model=settings.task_compiler.model,
+                call_fn=lambda: compile_task(
+                    client,
+                    model=settings.task_compiler.model,
+                    raw_prompt=ctx.raw_prompt,
+                    timeout_seconds=settings.task_compiler.timeout_seconds,
+                ),
+                timeout=settings.task_compiler.timeout_seconds + 10,
+            )
+            ctx.add_trace(
+                f"Task compiled: route={task_result.task_spec.recommended_route}, risk={task_result.task_spec.risk_level}, "
+                f"subtasks={len(task_result.task_spec.subtasks)}, ambiguities={len(task_result.task_spec.ambiguities)} "
+                f"[{task_result.latency_ms:.0f}ms]"
+            )
+        except (BudgetExhaustedError, TimeoutError):
+            task_result = TaskCompilerResult(
+                task_spec=TaskSpec(
+                    objective=ctx.raw_prompt[:200],
+                    context=ctx.raw_prompt,
+                    recommended_route="complex",
+                    risk_level="medium",
+                    assumptions=["Budget exhausted — task compiler skipped"],
+                ),
+                needs_clarification=False,
+                clarification_question="",
+                raw_json="",
+                latency_ms=0,
+            )
+            ctx.add_trace("Budget exhausted — task compiler skipped, defaulting to complex route")
 
     ctx.task_spec = task_result.task_spec
 
