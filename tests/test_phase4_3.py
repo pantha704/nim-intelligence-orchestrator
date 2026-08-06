@@ -290,6 +290,63 @@ class TestAggregation:
         t = _trial("direct", "arithmetic", deterministic=True, status="passed")
         assert effective_correct(t, {}) == (True, "passed")
 
+    def test_factual_research_is_deterministic_not_rubric(self):
+        """Regression: factual_research has expected values and must be scored
+        by the deterministic semantic check — being in RUBRIC_CATEGORIES
+        forced every correct answer to failed (deterministic_met was never
+        set by the factual scorer)."""
+        from nim_orchestrator.benchmarks.four_mode import RUBRIC_CATEGORIES, effective_correct
+
+        assert "factual_research" not in RUBRIC_CATEGORIES
+        t = _trial("fixed_pipeline", "factual_research", deterministic=True, status="passed")
+        assert effective_correct(t, {}) == (True, "passed")
+
+    def test_factual_research_scored_by_expected_values(self):
+        s = score_answer({"check": "factual", "expected": ["Shakespeare"]},
+                         "Romeo and Juliet was written by William Shakespeare.")
+        assert s["deterministic_verified_correct"] is True
+        assert s["verification_status"] == "passed"
+
+    async def test_dag_single_node_fallback_answers_not_placeholder(self):
+        """Regression: a task with no subtasks must be executed as one node,
+        never answered with 'No subtasks to execute.'"""
+        from nim_orchestrator.agents import AgentConfig, AgentRole
+        from nim_orchestrator.budget import BudgetLimits, ExecutionBudget
+        from nim_orchestrator.config import DagConfig
+        from nim_orchestrator.context import PolicyResult, RunContext
+        from nim_orchestrator.dag import execute_dag
+
+        class CannedClient:
+            async def chat(self, **kwargs):
+                return ChatResult(content="The capital of France is Paris.", model="m",
+                                  latency_ms=5, finish_reason="stop")
+
+            async def close(self):
+                pass
+
+        from nim_orchestrator.task_compiler import TaskSpec
+
+        ctx = RunContext(raw_prompt="What is the capital of France?")
+        ctx.task_spec = TaskSpec(objective="What is the capital of France?",
+                                 subtasks=[], recommended_route="complex",
+                                 risk_level="low", context="What is the capital of France?")
+        ctx.policy = PolicyResult(
+            solver_configs=[AgentConfig(name="s", role=AgentRole.SOLVER, model="m", system_prompt="S.")],
+            synthesizer_config=AgentConfig(name="syn", role=AgentRole.SYNTHESIZER, model="m", system_prompt="Syn."),
+            verification_timeout=30,
+        )
+        ctx.budget = ExecutionBudget(limits=BudgetLimits(max_model_calls=10))
+        ctx.budget.start()
+
+        await execute_dag(CannedClient(), ctx, DagConfig(max_alternates=1))
+
+        assert ctx.mode == "dag"
+        assert ctx.answer
+        assert "No subtasks to execute" not in ctx.answer
+        assert len(ctx.dag_nodes) == 1
+        assert ctx.dag_nodes[0].id == "task"
+        assert any("single-node" in t for t in ctx.trace)
+
     def test_effective_correct_rubric(self):
         t = _trial("direct", "systems_architecture", met=True, status="judged", case_id="a")
         judge = {("a", 0, "direct"): 8.0}
@@ -524,7 +581,7 @@ class TestResumption:
         assert '"kind": "trial"' in jsonl
         # judge events exist as separate records for rubric categories
         judge_lines = [l for l in jsonl.splitlines() if '"kind": "judge"' in l]
-        assert len(judge_lines) == 3  # research + architecture + security
+        assert len(judge_lines) == 2  # architecture + security (research is deterministic)
 
         # resume: same run config → nothing duplicated
         r2 = await run_benchmark4(
@@ -541,7 +598,7 @@ class TestResumption:
         )
         assert r3["trials"] == 20
         lines = (out / "benchmark_results.jsonl").read_text().splitlines()
-        assert len(lines) == len(jsonl.splitlines()) + 20 + 3
+        assert len(lines) == len(jsonl.splitlines()) + 20 + 2
 
     async def test_stratified_per_category_limit(self, tmp_path):
         from nim_orchestrator.benchmarks.four_mode import run_benchmark4

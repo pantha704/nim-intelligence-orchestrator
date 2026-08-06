@@ -53,10 +53,10 @@ from .dataset import DatasetError
 
 MODES = ("direct", "fixed_pipeline", "adaptive_dag", "adaptive_dag_specialists")
 # open-ended/prose categories: correctness requires coverage AND blinded rubric
-RUBRIC_CATEGORIES = {"systems_architecture", "security_review", "factual_research"}
+RUBRIC_CATEGORIES = {"systems_architecture", "security_review"}
 DETERMINISTIC_CATEGORIES = {
     "arithmetic", "coding", "debugging", "compound", "ambiguous",
-    "adversarial", "factual_control",
+    "adversarial", "factual_control", "factual_research",
 }
 FORCE_MODE = {
     "direct": "single",

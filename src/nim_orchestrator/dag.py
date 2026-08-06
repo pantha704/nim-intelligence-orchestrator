@@ -560,15 +560,11 @@ def sync_model_outcomes(ctx: RunContext) -> None:
 async def execute_dag(client: RouterClient, ctx: RunContext, dag_cfg: DagConfig) -> None:
     """Execute the TaskSpec subtask DAG, mutating ctx with the final answer.
 
-    Raises DagValidationError on an invalid graph — the caller falls back
-    to the fixed pipeline.
+    When the task compiler produced NO subtasks, the whole task is executed
+    as a single node — the DAG never returns a placeholder instead of
+    answering. Raises DagValidationError on an invalid graph — the caller
+    falls back to the fixed pipeline.
     """
-    if ctx.task_spec is None or not ctx.task_spec.subtasks:
-        ctx.add_trace("DAG skipped — no subtasks in task spec")
-        ctx.mode = "dag"
-        ctx.answer = "No subtasks to execute."
-        return
-
     # The DAG runs under its own limits on the shared budget — UNLESS the
     # benchmark pinned an equal budget across all modes (budget_override).
     if getattr(ctx, "budget_override", None) is None:
@@ -580,6 +576,28 @@ async def execute_dag(client: RouterClient, ctx: RunContext, dag_cfg: DagConfig)
             max_total_agents=ctx.budget.limits.max_total_agents,
         )
         ctx.budget._semaphore = asyncio.Semaphore(dag_cfg.max_concurrent_calls)
+
+    if ctx.task_spec is None or not ctx.task_spec.subtasks:
+        ctx.add_trace("DAG: no subtasks — executing the whole task as one node")
+        objective = (ctx.task_spec.objective if ctx.task_spec else ctx.raw_prompt)[:500]
+        single = DAGNode(id="task", objective=objective)
+        ctx.dag_nodes = [single]
+        risk = ctx.task_spec.risk_level if ctx.task_spec else "medium"
+        await execute_node(client, ctx, single, dag_cfg, ctx.raw_prompt, risk)
+        ctx.candidates = [
+            Candidate(
+                name="dag:task", model="dag", content=single.result,
+                error=single.error if single.status in ("failed", "blocked") else "",
+            )
+        ]
+        ctx.answer = await synthesize_dag_outputs(client, ctx, [single])
+        ctx.mode = "dag"
+        ctx.verification = await verify_answer(ctx.answer, ctx.raw_prompt, ctx.policy.verification_timeout)
+        ctx.add_trace(
+            f"DAG single-node done: {single.status} — final verification: "
+            f"{ctx.verification.status} ({len(ctx.verification.results)} checks)"
+        )
+        return
 
     nodes = build_dag(ctx.task_spec)  # raises DagValidationError on invalid graphs
     ctx.dag_nodes = nodes
