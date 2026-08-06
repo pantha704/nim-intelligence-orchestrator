@@ -138,3 +138,13 @@ difficulty_router:
     - "compare and contrast"
     - "trade-off"
   max_prompt_length_simple: 500
+
+dag:
+  # Adaptive specialist DAG (Phase 4.0). Disabled until it beats the fixed
+  # pipeline on representative benchmarks (Phase 4.3).
+  enabled: false
+  max_model_calls: 10
+  max_concurrent_calls: 6
+  max_alternates: 1
+  primary_model: deepseek-v4-flash
+  timeout_seconds: 30

@@ -38,6 +38,16 @@ class TaskCompilerConfig(BaseModel):
     timeout_seconds: int = 25
 
 
+class DagConfig(BaseModel):
+    """Adaptive DAG execution limits (Phase 4.0 MVP)."""
+    enabled: bool = False
+    max_model_calls: int = 10
+    max_concurrent_calls: int = 6
+    max_alternates: int = 1
+    primary_model: str = "deepseek-v4-flash"
+    timeout_seconds: int = 30
+
+
 class DifficultyRouterConfig(BaseModel):
     simple_keywords: list[str] = Field(default_factory=list)
     complexity_signals: list[str] = Field(default_factory=list)
@@ -54,6 +64,7 @@ class Settings(BaseModel):
     synthesizer: SynthesizerConfig | None = None
     difficulty_router: DifficultyRouterConfig = Field(default_factory=DifficultyRouterConfig)
     task_compiler: TaskCompilerConfig = TaskCompilerConfig()
+    dag: DagConfig = Field(default_factory=DagConfig)
     candidate_count: int = 5
     debate_rounds: int = 2
     refine_rounds: int = 2
@@ -109,6 +120,7 @@ def load_settings() -> Settings:
     judge_data = {}
     synthesizer_data = {}
     difficulty_data = {}
+    dag_data = {}
 
     if yaml_path.exists():
         with open(yaml_path) as f:
@@ -119,11 +131,13 @@ def load_settings() -> Settings:
         judge_data = raw.get("judge", {})
         synthesizer_data = raw.get("synthesizer", {})
         difficulty_data = raw.get("difficulty_router", {})
+        dag_data = raw.get("dag", {})
 
     candidates = [CandidateConfig(**c) for c in candidates_data] if candidates_data else []
     judge = JudgeConfig(**judge_data) if judge_data else None
     synthesizer = SynthesizerConfig(**synthesizer_data) if synthesizer_data else None
     difficulty = DifficultyRouterConfig(**difficulty_data) if difficulty_data else DifficultyRouterConfig()
+    dag = DagConfig(**dag_data) if dag_data else DagConfig()
 
     return Settings(
         router_base_url=base_url,
@@ -134,4 +148,5 @@ def load_settings() -> Settings:
         judge=judge,
         synthesizer=synthesizer,
         difficulty_router=difficulty,
+        dag=dag,
     )

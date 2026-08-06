@@ -108,6 +108,14 @@ async def handle_intelligence_request(
     ctx.policy = engine.decide(ctx.raw_prompt, task_spec=ctx.task_spec, force_mode=force_mode)
     ctx.add_trace(f"Policy: action={ctx.policy.action}, route={ctx.policy.route}, reason={ctx.policy.reason}")
 
+    if ctx.policy.action == "dag" or ctx.policy.use_dag:
+        from .dag import execute_dag
+
+        ctx.add_trace(f"Adaptive DAG — {ctx.policy.route}")
+        await execute_dag(client, ctx, settings.dag)
+        ctx.finish()
+        return ctx.to_response()
+
     if ctx.policy.action == "speculative":
         accepted = await engine.execute_speculative(ctx, client)
         if accepted:

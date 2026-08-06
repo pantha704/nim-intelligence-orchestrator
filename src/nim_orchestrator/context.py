@@ -62,11 +62,12 @@ def create_anon_mapping(candidates: list[Candidate]) -> AnonMapping:
 @dataclass
 class PolicyResult:
     """Single source of truth for all routing decisions."""
-    action: str = "full"  # "single" | "speculative" | "full" — what the API executes
+    action: str = "full"  # "single" | "speculative" | "full" | "dag" — what the API executes
     route: str = "complex"  # "direct" | "verifiable" | "complex" | "open_ended"
     should_bypass_compiler: bool = False
     should_speculate: bool = False
     should_run_full_pipeline: bool = True
+    use_dag: bool = False
     solver_configs: list[AgentConfig] = field(default_factory=list)
     reviewer_configs: list[AgentConfig] = field(default_factory=list)
     judge_config: AgentConfig | None = None

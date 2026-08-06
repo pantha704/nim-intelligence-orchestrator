@@ -17,7 +17,7 @@ def main():
 
     ask_parser = subparsers.add_parser("ask", help="Ask a question through the intelligence pipeline")
     ask_parser.add_argument("prompt", help="Question/prompt to process")
-    ask_parser.add_argument("--mode", choices=["auto", "single", "full"], default="auto")
+    ask_parser.add_argument("--mode", choices=["auto", "single", "full", "dag"], default="auto")
 
     bench_parser = subparsers.add_parser("bench", help="Run benchmark comparing modes")
     bench_parser.add_argument("--output", "-o", default=None, help="Save results to file")
@@ -36,6 +36,8 @@ def main():
             force_mode = "single"
         elif args.mode == "full":
             force_mode = "full"
+        elif args.mode == "dag":
+            force_mode = "dag"
 
         async def _ask():
             settings = load_settings()

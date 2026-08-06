@@ -75,6 +75,17 @@ class PolicyEngine:
             self._populate_agents(result)
             return result
 
+        if force_mode == "dag":
+            result.action = "dag"
+            result.route = "complex"
+            result.should_bypass_compiler = False
+            result.should_speculate = False
+            result.should_run_full_pipeline = False
+            result.use_dag = True
+            result.reason = "forced dag mode"
+            self._populate_agents(result)
+            return result
+
         # Compiler bypass — owned by PolicyEngine
         result.should_bypass_compiler = should_bypass_compiler(raw_prompt)
 
@@ -104,6 +115,20 @@ class PolicyEngine:
             result.should_speculate = False
             result.should_run_full_pipeline = True
             result.reason = f"{result.route} route — full pipeline"
+
+        # Adaptive DAG (Phase 4.0): only when enabled in config AND the task
+        # compiler captured subtasks. The fixed pipeline stays the default
+        # until the DAG beats it on benchmarks (Phase 4.3).
+        if (
+            self.settings.dag.enabled
+            and task_spec is not None
+            and task_spec.subtasks
+            and result.route != "direct"
+        ):
+            result.use_dag = True
+            result.action = "dag"
+            result.should_run_full_pipeline = False
+            result.reason = f"{result.route} route — adaptive DAG ({len(task_spec.subtasks)} subtasks)"
 
         self._populate_agents(result)
         return result
