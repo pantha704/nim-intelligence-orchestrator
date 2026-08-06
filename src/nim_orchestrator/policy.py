@@ -140,7 +140,7 @@ class PolicyEngine:
                 client,
                 ctx,
                 agent_name="single",
-                model="deepseek-v4-flash",
+                model=self.settings.task_compiler.model,
                 messages=[{"role": "user", "content": ctx.raw_prompt}],
                 temperature=0.2,
                 max_tokens=256,
@@ -165,7 +165,7 @@ class PolicyEngine:
 
         spec = await speculative_route(
             client,
-            model="deepseek-v4-flash",
+            model=self.settings.task_compiler.model,
             prompt=ctx.raw_prompt,
             max_quick_tokens=256,
             ctx=ctx,

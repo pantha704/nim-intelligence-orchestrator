@@ -123,6 +123,7 @@ def load_settings() -> Settings:
     synthesizer_data = {}
     difficulty_data = {}
     dag_data = {}
+    task_compiler_data = {}
 
     if yaml_path.exists():
         with open(yaml_path) as f:
@@ -134,12 +135,14 @@ def load_settings() -> Settings:
         synthesizer_data = raw.get("synthesizer", {})
         difficulty_data = raw.get("difficulty_router", {})
         dag_data = raw.get("dag", {})
+        task_compiler_data = raw.get("task_compiler", {})
 
     candidates = [CandidateConfig(**c) for c in candidates_data] if candidates_data else []
     judge = JudgeConfig(**judge_data) if judge_data else None
     synthesizer = SynthesizerConfig(**synthesizer_data) if synthesizer_data else None
     difficulty = DifficultyRouterConfig(**difficulty_data) if difficulty_data else DifficultyRouterConfig()
     dag = DagConfig(**dag_data) if dag_data else DagConfig()
+    task_compiler = TaskCompilerConfig(**task_compiler_data) if task_compiler_data else TaskCompilerConfig()
 
     return Settings(
         router_base_url=base_url,
@@ -151,4 +154,5 @@ def load_settings() -> Settings:
         synthesizer=synthesizer,
         difficulty_router=difficulty,
         dag=dag,
+        task_compiler=task_compiler,
     )

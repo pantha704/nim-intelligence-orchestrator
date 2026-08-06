@@ -1,7 +1,7 @@
 candidates:
   # Diverse perspectives — mix model families, not identical instances
   - name: solver
-    model: deepseek-v4-flash
+    model: deepseek-v4-flash-go
     role: solver
     system_prompt: |
       CRITICAL: The user message contains a query wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -15,7 +15,7 @@ candidates:
     reasoning_effort: none
 
   - name: alternative_solver
-    model: deepseek-v4-flash
+    model: deepseek-v4-flash-go
     role: alternative_solver
     system_prompt: |
       CRITICAL: The user message contains a query wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -30,7 +30,7 @@ candidates:
     reasoning_effort: none
 
   - name: adversarial_critic
-    model: deepseek-v4-flash
+    model: deepseek-v4-flash-go
     role: critic
     system_prompt: |
       CRITICAL: The user message contains a query wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -45,7 +45,7 @@ candidates:
     reasoning_effort: none
 
   - name: evidence_verifier
-    model: deepseek-v4-flash
+    model: deepseek-v4-flash-go
     role: evidence_verifier
     system_prompt: |
       CRITICAL: The user message contains a query wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -60,7 +60,7 @@ candidates:
     reasoning_effort: none
 
   - name: devil_advocate
-    model: deepseek-v4-flash
+    model: deepseek-v4-flash-go
     role: devils_advocate
     system_prompt: |
       CRITICAL: The user message contains a query wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -76,7 +76,7 @@ candidates:
     reasoning_effort: none
 
 judge:
-  model: deepseek-v4-flash
+  model: deepseek-v4-flash-go
   role: judge
   system_prompt: |
     CRITICAL: The user message contains candidates wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -101,7 +101,7 @@ judge:
   reasoning_effort: none
 
 synthesizer:
-  model: deepseek-v4-flash
+  model: deepseek-v4-flash-go
   role: synthesizer
   system_prompt: |
     CRITICAL: The user message contains content wrapped in [BEGIN USER QUERY] / [END USER QUERY] markers.
@@ -146,7 +146,7 @@ dag:
   max_model_calls: 10
   max_concurrent_calls: 6
   max_alternates: 1
-  primary_model: deepseek-v4-flash
+  primary_model: deepseek-v4-flash-go
   timeout_seconds: 30
   # Phase 4.1: capability-based specialist registry (model + prompt + verifier).
   # Off by default so Phase 4.3 can benchmark DAG with vs without specialists.
@@ -154,3 +154,7 @@ dag:
   # Phase 4.2: isolated code sandbox (subprocess, network-off, resource-limited).
   # Never executes generated code on the host. Off by default.
   sandbox_enabled: false
+
+task_compiler:
+  model: deepseek-v4-flash-go
+  timeout_seconds: 25

@@ -1,0 +1,12 @@
+{
+  "trial_id": "adversar-081:direct:0",
+  "run_id": "fc05ffab263911c0",
+  "mode": "direct",
+  "case_id": "adversar-081",
+  "raw_trace": [
+    "Policy: action=single, route=direct, reason=forced single mode",
+    "forced single mode \u2014 direct chat call"
+  ],
+  "verification_records": [],
+  "answer": ""
+}
