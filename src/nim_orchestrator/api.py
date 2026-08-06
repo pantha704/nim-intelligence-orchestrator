@@ -13,12 +13,16 @@ async def handle_intelligence_request(
     settings: Settings,
     raw_prompt: str,
     force_mode: str | None = None,
+    dag_config=None,
 ) -> dict:
     """Main entry point.
 
     One RunContext is created here and threaded through every stage
     (compiler, policy, speculative routing, full pipeline, verification).
     The API executes PolicyResult — all routing decisions live in PolicyEngine.
+
+    dag_config overrides settings.dag (used by the benchmark to toggle
+    specialists/sandbox per trial).
     """
 
     # --- Stage 0: Transport gate (minimal — size, encoding, emptiness only) ---
@@ -113,7 +117,7 @@ async def handle_intelligence_request(
 
         ctx.add_trace(f"Adaptive DAG — {ctx.policy.route}")
         try:
-            await execute_dag(client, ctx, settings.dag)
+            await execute_dag(client, ctx, dag_config or settings.dag)
             ctx.finish()
             return ctx.to_response()
         except DagValidationError as e:

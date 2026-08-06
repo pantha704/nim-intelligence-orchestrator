@@ -22,6 +22,17 @@ def main():
     bench_parser = subparsers.add_parser("bench", help="Run benchmark comparing modes")
     bench_parser.add_argument("--output", "-o", default=None, help="Save results to file")
 
+    bench4_parser = subparsers.add_parser(
+        "bench4", help="Phase 4.3 four-mode benchmark (direct/fixed/DAG/DAG+specialists)"
+    )
+    bench4_parser.add_argument("--split", choices=["dev", "sealed"], default="dev")
+    bench4_parser.add_argument("--repeats", type=int, default=3)
+    bench4_parser.add_argument("--limit", type=int, default=None,
+                               help="Only run the first N cases (smoke testing)")
+    bench4_parser.add_argument("--no-resume", action="store_true",
+                               help="Do not skip already-completed trials")
+    bench4_parser.add_argument("--out", default="artifacts")
+
     serve_parser = subparsers.add_parser("serve", help="Start the orchestrator API server")
     serve_parser.add_argument("--host", default=None)
     serve_parser.add_argument("--port", type=int, default=None)
@@ -86,6 +97,34 @@ def main():
             with open(args.output, "w") as f:
                 json.dump(results, f, indent=2)
             print(f"\nFull results saved to {args.output}", file=sys.stderr)
+
+    elif args.command == "bench4":
+        from .benchmarks.four_mode import main_live
+
+        print("Running Phase 4.3 benchmark (this may take a long time)...", file=sys.stderr)
+        result = main_live(
+            split=args.split,
+            limit=args.limit,
+            repeats=args.repeats,
+            out_dir=args.out,
+            resume=not args.no_resume,
+        )
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("  Phase 4.3 summary", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        for mode, rows in result["summary"].items():
+            if mode.startswith("_"):
+                continue
+            overall = rows.get("overall", {})
+            if not overall.get("n"):
+                continue
+            print(
+                f"  {mode:26s} n={overall['n']:3d} verified={overall.get('verified_correct_rate') or 0:.0%} "
+                f"latency_p50={overall.get('latency_ms_p50') or 0:.0f}ms",
+                file=sys.stderr,
+            )
+        print("=" * 60, file=sys.stderr)
+        print(f"Policy written to {args.out}/proposed_routing_policy.yaml", file=sys.stderr)
 
     elif args.command == "serve":
         settings = load_settings()

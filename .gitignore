@@ -9,3 +9,6 @@ logs/
 *.pid
 .env
 results.json
+
+# benchmark artifacts
+artifacts/
