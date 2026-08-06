@@ -12,3 +12,6 @@ results.json
 
 # benchmark artifacts
 artifacts/
+
+# live benchmark output (never commit)
+artifacts-live/
