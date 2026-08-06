@@ -92,46 +92,72 @@ class EmptyResponseError(Exception):
 
 
 async def budgeted_call(ctx, *, agent_name: str, model: str, call_fn, timeout: float = 30):
-    """Run call_fn under ExecutionBudget enforcement.
+    """Run call_fn under ExecutionBudget enforcement, with ONE logical retry
+    on empty responses.
 
     Reservation happens BEFORE the network request (atomic under the budget
     lock); the concurrency semaphore only bounds active in-flight calls.
     All outcomes — success, empty_response, timeout, transport/HTTP error,
     cancelled — are recorded in the call log and consume the reserved slot.
+
+    An empty completion (HTTP 200 with no content) is never a success: the
+    logical request is reissued ONCE (a second reserved slot), both
+    deployment attempts are recorded, and a final empty answer raises
+    EmptyResponseError. Transport/timeout errors are NOT retried here — the
+    router already retries those.
     """
+    first = await _attempt_once(ctx, agent_name, model, call_fn, timeout)
+    if first["ok"]:
+        return first["result"]
+    if first["status"] == "empty_response":
+        # one logical retry — record both deployment attempts
+        second = await _attempt_once(ctx, agent_name, model, call_fn, timeout)
+        if second["ok"]:
+            return second["result"]
+        if second["status"] == "empty_response":
+            raise EmptyResponseError(
+                f"empty response after retry from model '{model}' — "
+                "both deployment attempts returned no content"
+            )
+        raise second["error"]
+    raise first["error"]
+
+
+async def _attempt_once(ctx, agent_name: str, model: str, call_fn, timeout: float) -> dict:
+    """One reservation + call + outcome recording. Returns {ok, status, result|error}."""
     token = await ctx.budget.reserve_call(agent_name, model)
     try:
         async with ctx.budget.semaphore:
             result = await asyncio.wait_for(call_fn(), timeout=timeout)
         deployment = getattr(result, "deployment", dict)() or {}
+        latency = getattr(result, "latency_ms", 0) or 0
         if getattr(result, "ok", True) is False:
-            ctx.budget.complete_call(
-                token, getattr(result, "latency_ms", 0) or 0, 0,
-                status="empty_response", deployment=deployment,
-            )
-            raise EmptyResponseError(
-                f"empty response from model '{getattr(result, 'requested_model', model)}' "
-                f"(deployment {getattr(result, 'deployment_id', 'unknown')})"
-            )
+            ctx.budget.complete_call(token, latency, 0, status="empty_response", deployment=deployment)
+            return {
+                "ok": False,
+                "status": "empty_response",
+                "error": EmptyResponseError(
+                    f"empty response from model '{getattr(result, 'requested_model', model)}' "
+                    f"(deployment {getattr(result, 'deployment_id', 'unknown')})"
+                ),
+            }
         ctx.budget.complete_call(
-            token,
-            getattr(result, "latency_ms", 0) or 0,
+            token, latency,
             getattr(result, "tokens_generated", 0) or 0,
-            status="success",
-            deployment=deployment,
+            status="success", deployment=deployment,
         )
-        return result
+        return {"ok": True, "result": result}
     except TimeoutError:
         ctx.budget.complete_call(token, 0, 0, status="timeout")
-        raise
+        return {"ok": False, "status": "timeout", "error": TimeoutError("model call timed out")}
     except asyncio.CancelledError:
         ctx.budget.complete_call(token, 0, 0, status="cancelled")
         raise
     except EmptyResponseError:
-        raise  # status already recorded as empty_response
-    except Exception:
+        raise  # recorded by the empty path above
+    except Exception as e:
         ctx.budget.complete_call(token, 0, 0, status="error")
-        raise
+        return {"ok": False, "status": "error", "error": e}
 
 
 async def budgeted_chat(

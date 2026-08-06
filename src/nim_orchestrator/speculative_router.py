@@ -9,6 +9,7 @@ import asyncio
 import re
 from dataclasses import dataclass
 
+from .boundaries import DIRECT_ANTI_INJECTION_SYSTEM_PROMPT, wrap_problem_block
 from .policy import classify_task_type
 from .router_client import BudgetExhaustedError, ChatResult, RouterClient, budgeted_chat
 
@@ -60,7 +61,12 @@ async def speculative_route(
                 ctx,
                 agent_name="speculative",
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    # raw prompt only inside the structured data boundary,
+                    # with the anti-injection system prompt every agent has
+                    {"role": "system", "content": DIRECT_ANTI_INJECTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": wrap_problem_block(prompt)},
+                ],
                 temperature=0.2,
                 reasoning_effort="none",
                 max_tokens=max_quick_tokens,
@@ -70,7 +76,10 @@ async def speculative_route(
             result = await asyncio.wait_for(
                 client.chat(
                     model=model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role": "system", "content": DIRECT_ANTI_INJECTION_SYSTEM_PROMPT},
+                        {"role": "user", "content": wrap_problem_block(prompt)},
+                    ],
                     temperature=0.2,
                     reasoning_effort="none",
                     max_tokens=max_quick_tokens,

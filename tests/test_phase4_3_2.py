@@ -160,7 +160,7 @@ class TestFixedPipelineBoundaries:
 
 
 class TestEmptyResponses:
-    async def test_empty_response_raises_and_is_recorded(self):
+    async def test_empty_response_retries_once_then_raises(self):
         class EmptyClient:
             async def chat(self, **kwargs):
                 return ChatResult(content="", model="m", latency_ms=50,
@@ -170,14 +170,54 @@ class TestEmptyResponses:
         with pytest.raises(EmptyResponseError):
             await budgeted_chat(EmptyClient(), ctx, agent_name="s1", model="m", messages=[])
 
-        entry = ctx.budget._call_log[0]
-        assert entry["status"] == "empty_response"
-        assert ctx.budget.model_calls == 1  # consumed the slot
-        assert entry["deployment_id"] == "m-go-key-1"
+        # both deployment attempts recorded — never a silent success
+        assert len(ctx.budget._call_log) == 2
+        for entry in ctx.budget._call_log:
+            assert entry["status"] == "empty_response"
+            assert entry["deployment_id"] == "m-go-key-1"
+        assert ctx.budget.model_calls == 2  # both attempts consumed budget slots
 
-    async def test_empty_response_triggers_alternate(self):
-        """A solver returning empty content must fail the attempt so the
-        alternate agent (failover) runs."""
+    async def test_empty_response_retry_recovers_with_second_attempt(self):
+        """One logical retry: empty first attempt, content on the retry."""
+        class EmptyThenOk:
+            def __init__(self):
+                self.calls = 0
+
+            async def chat(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return ChatResult(content="", model="m", latency_ms=10,
+                                      deployment_id="m-go-key-1")
+                return ChatResult(content="Paris", model="m", latency_ms=10,
+                                  deployment_id="m-go-key-1")
+
+        ctx = _ctx()
+        result = await budgeted_chat(EmptyThenOk(), ctx, agent_name="s1", model="m", messages=[])
+        assert result.content == "Paris"
+        statuses = [e["status"] for e in ctx.budget._call_log]
+        assert statuses == ["empty_response", "success"]
+        assert ctx.budget.model_calls == 2
+
+    async def test_empty_response_retry_blocked_by_budget(self):
+        """With no budget for a second reservation, the retry cannot run and
+        the empty response is the final recorded outcome."""
+        from nim_orchestrator.budget import BudgetExhaustedError as BEE
+
+        class EmptyClient:
+            async def chat(self, **kwargs):
+                return ChatResult(content="", model="m", latency_ms=10)
+
+        ctx = _ctx()
+        ctx.budget.limits = BudgetLimits(max_model_calls=1)
+        with pytest.raises(BEE):
+            await budgeted_chat(EmptyClient(), ctx, agent_name="s1", model="m", messages=[])
+        # only ONE attempt could be reserved; the empty is recorded, never a success
+        assert ctx.budget.model_calls == 1
+        assert ctx.budget._call_log[0]["status"] == "empty_response"
+
+    async def test_empty_response_recovers_inside_agent(self):
+        """The retry recovers the primary attempt, so the alternate agent is
+        NOT needed — the node passes with one logical attempt."""
         class EmptyThenOk:
             def __init__(self):
                 self.calls = 0
@@ -192,11 +232,42 @@ class TestEmptyResponses:
         node = DAGNode(id="s1", objective="Compute 17 times 23", acceptance_criteria="Output correct")
         await execute_node(EmptyThenOk(), ctx, node, DagConfigFor(max_alternates=1), "context", risk_level="low")
 
-        assert node.attempts == 2
-        assert node.alternates_used == 1
-        # the alternate (non-empty) attempt produced the final result
-        assert node.status != "failed"
+        assert node.attempts == 1  # primary recovered via the retry
+        assert node.alternates_used == 0
         assert ctx.budget._call_log[0]["status"] == "empty_response"
+        assert ctx.budget._call_log[1]["status"] == "success"
+
+    async def test_never_silently_returns_empty_answer(self):
+        """A final empty answer is a visible failure, never a silent success."""
+        class EmptyClient:
+            async def chat(self, **kwargs):
+                return ChatResult(content="", model="m", latency_ms=10)
+
+        ctx = _ctx()
+        with pytest.raises(EmptyResponseError):
+            await budgeted_chat(EmptyClient(), ctx, agent_name="s1", model="m", messages=[])
+
+    async def test_execute_single_transport_error_is_visible_failure(self):
+        """A transport/timeout error in direct mode must not crash the request."""
+        from nim_orchestrator.config import CandidateConfig, TaskCompilerConfig
+        from nim_orchestrator.policy import PolicyEngine
+
+        class BrokenClient:
+            async def chat(self, **kwargs):
+                raise TimeoutError("upstream timeout")
+
+        settings = Settings(
+            router_base_url="http://mock", router_api_key="mock",
+            primary_model="m", task_compiler=TaskCompilerConfig(model="m"),
+            candidates=[CandidateConfig(name="s", model="m", system_prompt="S.", role="solver")],
+        )
+        ctx = RunContext(raw_prompt="What is 2+2?")
+        ctx.start()
+        ctx.policy = PolicyEngine(settings).decide(ctx.raw_prompt, force_mode="single")
+        await PolicyEngine(settings).execute_single(ctx, BrokenClient())
+
+        assert ctx.mode == "error"
+        assert any("failed" in t for t in ctx.trace)
 
     async def test_empty_response_degrades_model_health(self):
         from nim_orchestrator.models import ModelRegistry

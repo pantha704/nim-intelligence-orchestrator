@@ -6,7 +6,7 @@ Forced modes, compiler bypass, speculative routing and escalation all live here.
 from .agents import AgentConfig, AgentRole
 from .config import Settings
 from .context import PolicyResult
-from .router_client import BudgetExhaustedError, budgeted_chat
+from .router_client import BudgetExhaustedError, EmptyResponseError, budgeted_chat
 from .task_compiler import should_bypass_compiler
 
 
@@ -134,25 +134,41 @@ class PolicyEngine:
         return result
 
     async def execute_single(self, ctx, client) -> None:
-        """Forced single mode — one budgeted direct chat call."""
+        """Forced single mode — one budgeted direct chat call.
+
+        The raw prompt is untrusted and only reaches the model inside the
+        structured data boundary. Empty responses are retried once inside
+        budgeted_call; a final empty answer fails the call visibly.
+        """
+        from .boundaries import DIRECT_ANTI_INJECTION_SYSTEM_PROMPT, wrap_problem_block
+
         try:
             result = await budgeted_chat(
                 client,
                 ctx,
                 agent_name="single",
                 model=self.settings.primary_model,
-                messages=[{"role": "user", "content": ctx.raw_prompt}],
+                messages=[
+                    {"role": "system", "content": DIRECT_ANTI_INJECTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": wrap_problem_block(ctx.raw_prompt)},
+                ],
                 temperature=0.2,
-                max_tokens=256,
+                # reasoning models consume max_tokens on reasoning_content —
+                # keep headroom so the visible answer is not starved empty
+                max_tokens=1024,
                 timeout=30,
             )
             ctx.answer = result.content
             ctx.mode = "single"
             ctx.total_latency_ms = result.latency_ms
             ctx.add_trace("forced single mode — direct chat call")
-        except BudgetExhaustedError as e:
+        except (BudgetExhaustedError, EmptyResponseError) as e:
             ctx.mode = "error"
-            ctx.add_trace(f"single mode skipped: {e}")
+            ctx.add_trace(f"single mode failed: {e}")
+        except Exception as e:
+            # transport/timeout errors must fail visibly, never crash the request
+            ctx.mode = "error"
+            ctx.add_trace(f"single mode failed: {type(e).__name__}: {e}")
 
     async def execute_speculative(self, ctx, client) -> bool:
         """Run the speculative quick call.
@@ -167,11 +183,10 @@ class PolicyEngine:
             client,
             model=self.settings.primary_model,
             prompt=ctx.raw_prompt,
-            max_quick_tokens=256,
+            max_quick_tokens=1024,
             ctx=ctx,
         )
         ctx.add_trace(f"Speculative route: {spec.reason} (route={spec.route})")
-
         if spec.escalate:
             ctx.add_trace("Speculative route: escalating to full pipeline")
             return False
