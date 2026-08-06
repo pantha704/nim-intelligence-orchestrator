@@ -1,10 +1,13 @@
-"""Phase 4.0 tests: adaptive specialist DAG (MVP).
+"""Phase 4.0.1 tests: DAG correctness and dependency semantics.
 
-Proves topological ordering, node execution with primary/alternate agents,
-dependency context propagation, budget limits, policy gating, and the
-end-to-end DAG path through the API.
+Proves strict node verification states (verified_pass | partial | unverified
+| failed | blocked), acceptance-criteria checking, the expansion policy,
+dependency blocking and failed-output isolation, DAG validation, and
+fixed-pipeline fallback on invalid graphs.
 """
 import os
+
+import pytest
 
 from nim_orchestrator.agents import AgentConfig, AgentRole
 from nim_orchestrator.budget import BudgetLimits, ExecutionBudget
@@ -16,9 +19,19 @@ from nim_orchestrator.config import (
     SynthesizerConfig,
 )
 from nim_orchestrator.context import PolicyResult, RunContext
-from nim_orchestrator.dag import DAGNode, build_dag, execute_dag, execute_node
+from nim_orchestrator.dag import (
+    DAGNode,
+    DagValidationError,
+    build_dag,
+    check_acceptance,
+    execute_dag,
+    execute_node,
+    node_status,
+    validate_dag,
+)
 from nim_orchestrator.router_client import ChatResult
 from nim_orchestrator.task_compiler import Subtask, TaskSpec
+from nim_orchestrator.verifiers.external_checks import VerificationReport
 
 ROUTER_AVAILABLE = os.environ.get("NIM_ROUTER_AVAILABLE", "0") == "1"
 
@@ -26,7 +39,7 @@ ROUTER_AVAILABLE = os.environ.get("NIM_ROUTER_AVAILABLE", "0") == "1"
 class RecordingClient:
     """Records every user message; returns configurable content."""
 
-    def __init__(self, content="The answer is 42."):
+    def __init__(self, content="17 * 23 = 391"):
         self.content = content
         self.calls = 0
         self.messages = []
@@ -73,27 +86,38 @@ def _subtask_spec():
 
 
 # ============================================================
-# 1. DAG construction
+# 1. DAG validation
 # ============================================================
 
 
-class TestBuildDag:
-    def test_topological_order_respects_dependencies(self):
-        spec = _subtask_spec()
-        nodes = build_dag(spec)
-        order = [n.id for n in nodes]
-        # s2 depends on s1 — s1 must come first
-        assert order.index("s1") < order.index("s2")
-        # s3 is independent — anywhere, but must be present
-        assert set(order) == {"s1", "s2", "s3"}
+class TestDagValidation:
+    def test_valid_spec_has_no_errors(self):
+        assert validate_dag(_subtask_spec()) == []
 
-    def test_dependencies_preserved_on_nodes(self):
-        nodes = build_dag(_subtask_spec())
-        by_id = {n.id: n for n in nodes}
-        assert by_id["s2"].depends_on == ["s1"]
-        assert by_id["s1"].depends_on == []
+    def test_duplicate_ids_reported(self):
+        spec = TaskSpec(
+            objective="x",
+            subtasks=[
+                Subtask(id="a", description="A"),
+                Subtask(id="a", description="A again"),
+            ],
+        )
+        errors = validate_dag(spec)
+        assert any("duplicate" in e for e in errors)
+        with pytest.raises(DagValidationError):
+            build_dag(spec)
 
-    def test_unknown_dependency_dropped(self):
+    def test_self_dependency_reported(self):
+        spec = TaskSpec(
+            objective="x",
+            subtasks=[Subtask(id="a", description="A", depends_on=["a"])],
+        )
+        errors = validate_dag(spec)
+        assert any("itself" in e for e in errors)
+        with pytest.raises(DagValidationError):
+            build_dag(spec)
+
+    def test_unknown_dependency_reported_not_dropped(self):
         spec = TaskSpec(
             objective="x",
             subtasks=[
@@ -101,11 +125,12 @@ class TestBuildDag:
                 Subtask(id="b", description="B", depends_on=["a"]),
             ],
         )
-        nodes = build_dag(spec)
-        assert nodes[0].id == "a"
-        assert nodes[0].depends_on == []
+        errors = validate_dag(spec)
+        assert any("ghost" in e for e in errors)
+        with pytest.raises(DagValidationError):
+            build_dag(spec)
 
-    def test_cycle_does_not_hang(self):
+    def test_cycle_reported(self):
         spec = TaskSpec(
             objective="x",
             subtasks=[
@@ -113,39 +138,123 @@ class TestBuildDag:
                 Subtask(id="b", description="B", depends_on=["a"]),
             ],
         )
-        nodes = build_dag(spec)
-        assert len(nodes) == 2
+        errors = validate_dag(spec)
+        assert any("cyclic" in e for e in errors)
+        with pytest.raises(DagValidationError):
+            build_dag(spec)
 
     def test_empty_subtasks_empty_dag(self):
         assert build_dag(TaskSpec(objective="x", subtasks=[])) == []
 
 
 # ============================================================
-# 2. Node execution
+# 2. Verification semantics
+# ============================================================
+
+
+class TestNodeStatus:
+    def test_verified_arithmetic_is_verified_pass(self):
+        spec = TaskSpec(
+            objective="Compute 17 times 23",
+            subtasks=[Subtask(id="s1", description="Compute 17 times 23", acceptance_criteria="The result must be 391")],
+        )
+        node = build_dag(spec)[0]
+        report = VerificationReport()
+        from nim_orchestrator.verifiers.external_checks import VerificationResult
+
+        report.add(VerificationResult(verifier_name="arithmetic", status="pass", details="17 * 23 = 391 ✓"))
+        acceptance = check_acceptance("17 * 23 = 391", [node.acceptance_criteria])
+        status = node_status(report, acceptance, node.objective, node.acceptance_criteria)
+        assert status == "verified_pass"
+        assert acceptance[0].status == "verified"
+
+    def test_unverified_answer_is_never_passed(self):
+        """Regression: 'Compute 17 times 23' with 'The result is 42.' must not pass."""
+        report = VerificationReport()
+        from nim_orchestrator.verifiers.external_checks import VerificationResult
+
+        report.add(VerificationResult(verifier_name="arithmetic", status="unverified", details="answer stated but no expression"))
+        report.add(VerificationResult(verifier_name="code_execution", status="pass", details="no code blocks found"))
+        acceptance = check_acceptance("The result is 42.", ["Output correct"])
+        status = node_status(report, acceptance, "Compute 17 times 23", "Output correct")
+        assert status != "verified_pass"
+        assert status == "unverified"
+
+    def test_acceptance_criteria_failure_is_failed(self):
+        report = VerificationReport()
+        from nim_orchestrator.verifiers.external_checks import VerificationResult
+
+        # Arithmetic passes, but the acceptance criterion demands 999
+        report.add(VerificationResult(verifier_name="arithmetic", status="pass", details="17 * 23 = 391 ✓"))
+        acceptance = check_acceptance("17 * 23 = 391", ["The answer must be 999"])
+        assert acceptance[0].status == "failed"
+        assert node_status(report, acceptance, "Compute 17 times 23", "The answer must be 999") == "failed"
+
+    def test_acceptance_criteria_verified_is_evidence(self):
+        report = VerificationReport()
+        from nim_orchestrator.verifiers.external_checks import VerificationResult
+
+        report.add(VerificationResult(verifier_name="arithmetic", status="unverified", details="no expression"))
+        acceptance = check_acceptance("The product is 391.", ["The result must be 391"])
+        assert acceptance[0].status == "verified"
+        # Evidence exists (criterion verified) but arithmetic is still
+        # informatively unverified → partial, never passed outright
+        status = node_status(report, acceptance, "Compute 17 times 23", "The result must be 391")
+        assert status == "partial"
+        assert status != "verified_pass"
+
+
+# ============================================================
+# 3. Node execution
 # ============================================================
 
 
 class TestNodeExecution:
-    def _node(self):
-        return DAGNode(id="s1", objective="Compute 17 times 23", acceptance_criteria="Correct product")
+    def _math_node(self):
+        return DAGNode(id="s1", objective="Compute 17 times 23", acceptance_criteria="The result must be 391")
 
-    async def test_primary_success_no_alternate(self):
+    def _unverifiable_node(self):
+        # Non-numeric criteria → no deterministic acceptance check available
+        return DAGNode(id="s1", objective="Compute 17 times 23", acceptance_criteria="Output correct")
+
+    async def test_verified_answer_passes_with_one_attempt(self):
         ctx = _ctx_with_policy()
-        client = RecordingClient(content="The result is 42.")
-        node = self._node()
+        client = RecordingClient(content="17 * 23 = 391")
+        node = self._math_node()
         await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
 
-        assert node.status == "passed"
+        assert node.status == "verified_pass"
         assert node.attempts == 1
         assert node.alternates_used == 0
         assert client.calls == 1
-        assert node.result == "The result is 42."
+
+    async def test_unverified_answer_does_not_pass(self):
+        """Regression: 'The result is 42.' for 'Compute 17 times 23' must not pass."""
+        ctx = _ctx_with_policy()
+        client = RecordingClient(content="The result is 42.")
+        node = self._unverifiable_node()
+        await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
+
+        assert node.status != "verified_pass"
+        assert node.status == "unverified"
+        # Medium risk → one alternate was tried
+        assert node.attempts == 2
+        assert node.alternates_used == 1
+
+    async def test_low_risk_unverified_gets_no_alternate(self):
+        ctx = _ctx_with_policy()
+        client = RecordingClient(content="The result is 42.")
+        node = self._unverifiable_node()
+        await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context", risk_level="low")
+
+        assert node.status == "unverified"
+        assert node.attempts == 1
+        assert node.alternates_used == 0
 
     async def test_failure_triggers_exactly_one_alternate(self):
         ctx = _ctx_with_policy()
-        # Wrong arithmetic always fails verification
         client = RecordingClient(content="17 * 23 = 999")
-        node = self._node()
+        node = self._math_node()
         await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
 
         assert node.status == "failed"
@@ -156,20 +265,28 @@ class TestNodeExecution:
     async def test_no_alternate_available_fails_after_primary(self):
         ctx = _ctx_with_policy(solvers=1)
         client = RecordingClient(content="17 * 23 = 999")
-        node = self._node()
+        node = self._math_node()
         await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
 
         assert node.status == "failed"
         assert node.attempts == 1
         assert node.alternates_used == 0
-        assert client.calls == 1
+
+    async def test_acceptance_criteria_failure_fails_node(self):
+        ctx = _ctx_with_policy()
+        client = RecordingClient(content="17 * 23 = 391")
+        node = DAGNode(id="s1", objective="Compute 17 times 23", acceptance_criteria="The answer must be 999")
+        await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
+
+        assert node.status == "failed"
+        assert any(a.status == "failed" for a in node.acceptance)
 
     async def test_budget_exhaustion_stops_node(self):
         ctx = _ctx_with_policy()
         ctx.budget = ExecutionBudget(limits=BudgetLimits(max_model_calls=0))
         ctx.budget.start()
         client = RecordingClient(content="17 * 23 = 999")
-        node = self._node()
+        node = self._math_node()
         await execute_node(client, ctx, node, DagConfig(max_alternates=1), "context")
 
         assert node.status == "failed"
@@ -178,26 +295,29 @@ class TestNodeExecution:
 
 
 # ============================================================
-# 3. Dependency context propagation
+# 4. Dependency semantics
 # ============================================================
 
 
-class TestDependencyContext:
-    async def test_dependent_node_receives_dependency_output(self):
-        spec = TaskSpec(
+class TestDependencySemantics:
+    def _dep_spec(self):
+        return TaskSpec(
             objective="Do it",
             subtasks=[
                 Subtask(id="s1", description="Find the input value", depends_on=[]),
                 Subtask(id="s2", description="Compute output from input", depends_on=["s1"]),
+                Subtask(id="s3", description="Independent check", depends_on=[]),
             ],
             recommended_route="complex",
+            risk_level="medium",
             context="Original problem prompt",
         )
-        ctx = _ctx_with_policy(task_spec=spec)
-        client = RecordingClient(content="The answer is 42.")
+
+    async def test_dependent_node_receives_dependency_output(self):
+        ctx = _ctx_with_policy(task_spec=self._dep_spec())
+        client = RecordingClient(content="17 * 23 = 391")
         await execute_dag(client, ctx, DagConfig(max_alternates=1))
 
-        # s1's output must appear in s2's node prompt (not the synthesizer's)
         s2_msgs = None
         for msgs in client.messages:
             user = msgs[1]["content"] if len(msgs) > 1 else ""
@@ -205,24 +325,86 @@ class TestDependencyContext:
                 s2_msgs = user
         assert s2_msgs is not None
         assert "--- s1 ---" in s2_msgs
-        assert "The answer is 42." in s2_msgs
+        assert "17 * 23 = 391" in s2_msgs
 
-    async def test_all_nodes_executed_in_order(self):
-        spec = _subtask_spec()
-        ctx = _ctx_with_policy(task_spec=spec)
-        client = RecordingClient(content="The answer is 42.")
+    async def test_failed_dependency_blocks_dependent(self):
+        ctx = _ctx_with_policy(task_spec=self._dep_spec())
+        client = RecordingClient(content="17 * 23 = 999")
         await execute_dag(client, ctx, DagConfig(max_alternates=1))
 
-        # 3 nodes + 1 synthesizer = 4 calls
-        assert client.calls == 4
-        assert ctx.mode == "dag"
-        assert ctx.answer
-        assert len(ctx.candidates) == 3
-        assert any("dag:s1" == c.name for c in ctx.candidates)
+        by_id = {n.id: n for n in ctx.dag_nodes}
+        s1 = by_id["s1"]
+        s2 = by_id["s2"]
+        s3 = by_id["s3"]
+        assert s1.status == "failed"
+        assert s2.status == "blocked"
+        assert "s1" in s2.error
+        # Independent node still ran (not blocked) — content fails verification
+        assert s3.status != "blocked"
+        assert s3.status == "failed"
+
+    async def test_unverified_dependency_blocks_dependent(self):
+        ctx = _ctx_with_policy(task_spec=self._dep_spec())
+        client = RecordingClient(content="The result is 42.")
+        await execute_dag(client, ctx, DagConfig(max_alternates=1))
+
+        by_id = {n.id: n for n in ctx.dag_nodes}
+        assert by_id["s1"].status == "unverified"
+        assert by_id["s2"].status == "blocked"
+
+    async def test_failed_output_never_fed_forward(self):
+        ctx = _ctx_with_policy(task_spec=self._dep_spec())
+        client = RecordingClient(content="17 * 23 = 999")
+        await execute_dag(client, ctx, DagConfig(max_alternates=1))
+
+        # s2 was blocked → its node prompt never exists; and no node prompt
+        # for any node contains a failed output as trusted context
+        for msgs in client.messages:
+            user = msgs[1]["content"] if len(msgs) > 1 else ""
+            if "Acceptance criteria:" in user:
+                assert "999" not in user
+
+    async def test_acceptably_completed_dependency_fed(self):
+        ctx = _ctx_with_policy(task_spec=self._dep_spec())
+        client = RecordingClient(content="17 * 23 = 391")
+        await execute_dag(client, ctx, DagConfig(max_alternates=1))
+
+        by_id = {n.id: n for n in ctx.dag_nodes}
+        assert by_id["s1"].status == "verified_pass"
+        assert by_id["s2"].status == "verified_pass"
+        assert by_id["s3"].status == "verified_pass"
 
 
 # ============================================================
-# 4. DAG budget limits
+# 5. Verification plan assignment
+# ============================================================
+
+
+class TestVerificationPlan:
+    def test_relevant_global_plan_items_assigned_to_nodes(self):
+        spec = TaskSpec(
+            objective="Build a system",
+            verification_plan=[
+                "Check the arithmetic in the computation is correct",
+                "Ensure the design is scalable",
+            ],
+            subtasks=[
+                Subtask(id="s1", description="Compute the totals", depends_on=[]),
+                Subtask(id="s2", description="Design the architecture", depends_on=[]),
+            ],
+            recommended_route="complex",
+            context="c",
+        )
+        nodes = build_dag(spec)
+        by_id = {n.id: n for n in nodes}
+        s1_plan = " ".join(by_id["s1"].verification_plan)
+        s2_plan = " ".join(by_id["s2"].verification_plan)
+        assert "arithmetic" in s1_plan
+        assert "scalable" in s2_plan
+
+
+# ============================================================
+# 6. DAG budget limits
 # ============================================================
 
 
@@ -237,22 +419,25 @@ class TestDagBudget:
         assert client.calls == 2
         assert ctx.budget.model_calls == 2
         assert ctx.mode == "dag"
-        # Synthesis degraded to raw outputs (budget exhausted)
-        assert ctx.answer
+        # No acceptable outputs → nothing to synthesize (honest empty result)
+        assert ctx.answer == ""
+        by_id = {n.id: n for n in ctx.dag_nodes}
+        assert by_id["s1"].status == "failed"
+        assert by_id["s2"].status == "blocked"
 
-    async def test_dag_reports_failed_nodes(self):
+    async def test_dag_reports_all_states(self):
         spec = _subtask_spec()
         ctx = _ctx_with_policy(task_spec=spec)
         client = RecordingClient(content="17 * 23 = 999")
         await execute_dag(client, ctx, DagConfig(max_alternates=1))
 
         trace = "\n".join(ctx.trace)
-        assert "DAG done: 0 passed, 3 failed" in trace
+        assert "DAG done: 0 verified_pass, 0 partial, 0 unverified, 2 failed, 1 blocked" in trace
         assert "DAG final verification" in trace
 
 
 # ============================================================
-# 5. Policy gating
+# 7. Policy gating
 # ============================================================
 
 
@@ -309,11 +494,24 @@ class TestPolicyGating:
 
 
 # ============================================================
-# 6. End-to-end API
+# 8. End-to-end API
 # ============================================================
 
 
 class TestDagAPI:
+    def _dag_settings(self, dag_enabled=False):
+        return Settings(
+            router_base_url="http://mock",
+            router_api_key="mock",
+            candidates=[
+                CandidateConfig(name="solver", model="m", system_prompt="S.", role="solver"),
+                CandidateConfig(name="alternative_solver", model="m", system_prompt="A.", role="alternative_solver"),
+            ],
+            judge=JudgeConfig(model="m", system_prompt="J."),
+            synthesizer=SynthesizerConfig(model="m", system_prompt="Syn."),
+            dag=DagConfig(enabled=dag_enabled),
+        )
+
     async def test_forced_dag_mode_end_to_end(self):
         from nim_orchestrator.api import handle_intelligence_request
 
@@ -327,31 +525,21 @@ class TestDagAPI:
                     return ChatResult(
                         content='{"objective": "Design a system", "risk_level": "medium", '
                                 '"recommended_route": "complex", '
-                                '"subtasks": [{"id": "s1", "description": "Design the architecture", "depends_on": []}, '
-                                '{"id": "s2", "description": "Specify the data model", "depends_on": ["s1"]}]}',
+                                '"subtasks": [{"id": "s1", "description": "Compute 17 times 23", "depends_on": [], '
+                                '"acceptance_criteria": "The result must be 391"}, '
+                                '{"id": "s2", "description": "State the product", "depends_on": ["s1"]}]}',
                         model="m",
                         latency_ms=100,
                         finish_reason="stop",
                     )
-                return ChatResult(content="The answer is 42.", model="m", latency_ms=5, finish_reason="stop")
+                return ChatResult(content="17 * 23 = 391", model="m", latency_ms=5, finish_reason="stop")
 
             async def close(self):
                 pass
 
-        settings = Settings(
-            router_base_url="http://mock",
-            router_api_key="mock",
-            candidates=[
-                CandidateConfig(name="solver", model="m", system_prompt="S.", role="solver"),
-                CandidateConfig(name="alternative_solver", model="m", system_prompt="A.", role="alternative_solver"),
-            ],
-            judge=JudgeConfig(model="m", system_prompt="J."),
-            synthesizer=SynthesizerConfig(model="m", system_prompt="Syn."),
-        )
-
         client = CompilerThenDagClient()
         result = await handle_intelligence_request(
-            client, settings, "Design a system with a data model", force_mode="dag"
+            client, self._dag_settings(), "Design a system with a data model", force_mode="dag"
         )
 
         assert result["mode"] == "dag"
@@ -361,7 +549,42 @@ class TestDagAPI:
         assert result["budget"]["model_calls"] == 4  # compiler + 2 nodes + synthesizer
         trace = result.get("pipeline_trace", [])
         assert any("DAG:" in t for t in trace)
-        assert any("DAG done" in t for t in trace)
+        assert any("verified_pass" in t for t in trace)
+
+    async def test_invalid_dag_falls_back_to_fixed_pipeline(self):
+        """Acceptance: invalid DAG (cycle) traces the reason and falls back."""
+        from nim_orchestrator.api import handle_intelligence_request
+
+        class CyclicCompilerClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def chat(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return ChatResult(
+                        content='{"objective": "Design a system", "risk_level": "medium", '
+                                '"recommended_route": "complex", '
+                                '"subtasks": [{"id": "a", "description": "A", "depends_on": ["b"]}, '
+                                '{"id": "b", "description": "B", "depends_on": ["a"]}]}',
+                        model="m",
+                        latency_ms=100,
+                        finish_reason="stop",
+                    )
+                return ChatResult(content="The answer is 42.", model="m", latency_ms=5, finish_reason="stop")
+
+            async def close(self):
+                pass
+
+        result = await handle_intelligence_request(
+            CyclicCompilerClient(), self._dag_settings(dag_enabled=True), "Design a system"
+        )
+
+        assert result["mode"] == "full"
+        trace = result.get("pipeline_trace", [])
+        assert any("DAG invalid" in t for t in trace)
+        assert any("cyclic" in t for t in trace)
+        assert any("Starting full pipeline" in t for t in trace)
 
     async def test_dag_stays_disabled_without_force(self):
         """Config gate: dag disabled → even with subtasks, mode stays full."""
@@ -380,17 +603,8 @@ class TestDagAPI:
             async def close(self):
                 pass
 
-        settings = Settings(
-            router_base_url="http://mock",
-            router_api_key="mock",
-            candidates=[CandidateConfig(name="solver", model="m", system_prompt="S.", role="solver")],
-            judge=JudgeConfig(model="m", system_prompt="J."),
-            synthesizer=SynthesizerConfig(model="m", system_prompt="Syn."),
-            dag=DagConfig(enabled=False),
-        )
-
         result = await handle_intelligence_request(
-            CompilerClient(), settings, "Prove the theorem"
+            CompilerClient(), self._dag_settings(dag_enabled=False), "Prove the theorem"
         )
         assert result["mode"] == "full"
         trace = result.get("pipeline_trace", [])

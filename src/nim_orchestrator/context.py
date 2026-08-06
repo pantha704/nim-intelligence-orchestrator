@@ -93,6 +93,7 @@ class RunContext:
     budget: ExecutionBudget = field(default_factory=ExecutionBudget)
     policy: PolicyResult = field(default_factory=PolicyResult)
     candidates: list[Candidate] = field(default_factory=list)
+    dag_nodes: list = field(default_factory=list)
     anon: AnonMapping | None = None
     critique: dict[str, str] = field(default_factory=dict)
     clustering: ClusteringResult | None = None

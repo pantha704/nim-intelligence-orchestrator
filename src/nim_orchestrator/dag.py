@@ -1,19 +1,27 @@
-"""Phase 4.0 — Adaptive specialist DAG (MVP).
+"""Phase 4.0.1 — Adaptive specialist DAG with correctness semantics.
 
-Executes the subtasks already captured inside TaskSpec as a dependency-aware
-graph. Each node receives its objective, relevant context (including outputs
-of its dependencies), acceptance criteria, assigned specialist and
-verification plan.
+Executes TaskSpec subtasks as a dependency-aware graph with strict
+verification semantics:
 
-Limits (Phase 4.0):
-- 1 primary agent per node
-- maximum 1 alternate agent after failure
-- budget enforced through the shared ExecutionBudget (budgeted_call)
+- Node states: verified_pass | partial | unverified | failed | blocked.
+  UNVERIFIED is never treated as passed.
+- Acceptance criteria are deterministically checked when possible and
+  produce a structured AcceptanceResult per criterion.
+- Expansion: failed → 1 alternate; unverified/partial → alternate only for
+  medium/high-risk nodes; verified_pass → stop.
+- Dependencies: a node runs only when all required dependencies completed
+  acceptably (verified_pass | partial); failed/blocked/unverified
+  dependencies block dependents; failed output is never fed forward.
+- Validation: duplicate ids, cycles, self-dependencies and unknown
+  dependencies invalidate the DAG — the API then falls back to the fixed
+  pipeline.
 
-The fixed pipeline remains the baseline and fallback; the DAG only runs
-when PolicyEngine says so (config gate + subtasks present).
+The fixed pipeline remains the default; the DAG only runs when PolicyEngine
+says so (config gate + valid subtasks).
 """
+import ast
 import asyncio
+import re
 from dataclasses import dataclass, field
 
 from .agents import AgentConfig, AgentRole
@@ -23,6 +31,19 @@ from .context import RunContext
 from .router_client import RouterClient, budgeted_call
 from .task_compiler import TaskSpec
 from .verifiers.external_checks import VerificationReport, verify_answer
+
+
+class DagValidationError(ValueError):
+    """Raised when the TaskSpec subtask graph is invalid."""
+
+
+@dataclass
+class AcceptanceResult:
+    """Structured result for one acceptance criterion."""
+    criterion: str
+    status: str = "unverified"  # verified | unverified | failed
+    details: str = ""
+    check_type: str = "none"  # arithmetic | value_presence | python_syntax | none
 
 
 @dataclass
@@ -35,28 +56,224 @@ class DAGNode:
     verification_plan: list[str] = field(default_factory=list)
     result: str = ""
     verification: VerificationReport | None = None
-    status: str = "pending"  # pending | passed | failed | skipped
+    acceptance: list[AcceptanceResult] = field(default_factory=list)
+    status: str = "pending"  # verified_pass | partial | unverified | failed | blocked
+    risk_level: str = "medium"
     attempts: int = 0
     alternates_used: int = 0
     error: str = ""
+
+    @property
+    def completed_acceptably(self) -> bool:
+        return self.status in ("verified_pass", "partial")
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+
+def validate_dag(task_spec: TaskSpec) -> list[str]:
+    """Return a list of structural errors in the subtask graph (empty = valid)."""
+    errors: list[str] = []
+    ids = [s.id for s in task_spec.subtasks]
+    seen: set[str] = set()
+    for i in ids:
+        if i in seen:
+            errors.append(f"duplicate subtask id '{i}'")
+        seen.add(i)
+
+    known = set(ids)
+    for s in task_spec.subtasks:
+        for dep in s.depends_on:
+            if dep == s.id:
+                errors.append(f"subtask '{s.id}' depends on itself")
+            elif dep not in known:
+                errors.append(f"subtask '{s.id}' depends on unknown subtask '{dep}'")
+
+    # Cycle detection (DFS over known dependencies only)
+    deps = {s.id: [d for d in s.depends_on if d in known] for s in task_spec.subtasks}
+    state: dict[str, int] = {}  # 0 unvisited, 1 visiting, 2 done
+
+    def dfs(nid: str) -> None:
+        state[nid] = 1
+        for d in deps.get(nid, []):
+            if state.get(d) == 1:
+                errors.append(f"cyclic dependency involving '{nid}' and '{d}'")
+            elif state.get(d, 0) != 2:
+                dfs(d)
+        state[nid] = 2
+
+    for s in task_spec.subtasks:
+        if state.get(s.id, 0) != 2:
+            dfs(s.id)
+
+    return list(dict.fromkeys(errors))
+
+
+# ============================================================
+# Verification semantics
+# ============================================================
+
+
+def check_acceptance(answer: str, criteria: list[str]) -> list[AcceptanceResult]:
+    """Deterministically check each acceptance criterion where possible.
+
+    - criteria mentioning compilation/syntax → parse Python code blocks
+    - criteria with numbers → check the expected value appears in the answer
+    - anything else → unverified (no deterministic check available)
+    """
+    results: list[AcceptanceResult] = []
+    for criterion in criteria:
+        c = criterion.strip()
+        if not c:
+            continue
+        low = c.lower()
+
+        if re.search(r"\b(?:compile|syntax|parse|valid python|runs? without error|no errors)\b", low):
+            blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", answer, re.DOTALL)
+            if not blocks:
+                results.append(AcceptanceResult(
+                    criterion=c, status="unverified", check_type="python_syntax",
+                    details="no code blocks in answer to check",
+                ))
+                continue
+            bad = []
+            for i, code in enumerate(blocks):
+                try:
+                    ast.parse(code)
+                except SyntaxError as e:
+                    bad.append(f"block {i}: {e}")
+            if bad:
+                results.append(AcceptanceResult(
+                    criterion=c, status="failed", check_type="python_syntax",
+                    details="; ".join(bad),
+                ))
+            else:
+                results.append(AcceptanceResult(
+                    criterion=c, status="verified", check_type="python_syntax",
+                    details=f"{len(blocks)} block(s) parse successfully",
+                ))
+            continue
+
+        nums = re.findall(r"\d+(?:\.\d+)?", c)
+        if nums:
+            expected = nums[-1]
+            answer_nums = re.findall(r"\d+(?:\.\d+)?", answer)
+            if expected in answer:
+                results.append(AcceptanceResult(
+                    criterion=c, status="verified", check_type="value_presence",
+                    details=f"answer contains expected value {expected}",
+                ))
+            elif answer_nums:
+                results.append(AcceptanceResult(
+                    criterion=c, status="failed", check_type="value_presence",
+                    details=f"expected {expected}, answer contains {answer_nums[:5]}",
+                ))
+            else:
+                results.append(AcceptanceResult(
+                    criterion=c, status="unverified", check_type="value_presence",
+                    details="answer contains no numbers to compare",
+                ))
+            continue
+
+        results.append(AcceptanceResult(
+            criterion=c, status="unverified", check_type="none",
+            details="no deterministic check available for this criterion",
+        ))
+    return results
+
+
+def _meaningful_evidence(report: VerificationReport) -> bool:
+    """A pass that actually proves something about the answer (not a trivial
+    'no code blocks found' pass)."""
+    for r in report.results:
+        if r.status != "pass":
+            continue
+        if r.verifier_name == "arithmetic":
+            return True
+        if r.verifier_name == "python_syntax" and "no code blocks" not in r.details:
+            return True
+    return False
+
+
+def _informative_unverified(report: VerificationReport, objective: str, criteria_text: str) -> bool:
+    """An unverified check that matters for this node (code present but not
+    executed; arithmetic expected but not checkable)."""
+    haystack = f"{objective} {criteria_text}"
+    for r in report.results:
+        if r.status != "unverified":
+            continue
+        if r.verifier_name == "code_execution":
+            return True
+        if r.verifier_name == "arithmetic" and re.search(r"\d", haystack):
+            return True
+    return False
+
+
+def node_status(answer_report: VerificationReport, acceptance: list[AcceptanceResult], objective: str, criteria_text: str) -> str:
+    """Derive the node verification state. UNVERIFIED is never passed."""
+    if answer_report.has_failures or any(a.status == "failed" for a in acceptance):
+        return "failed"
+
+    acceptance_verified = bool(acceptance) and all(a.status == "verified" for a in acceptance)
+    evidence = acceptance_verified or _meaningful_evidence(answer_report)
+
+    if not evidence:
+        return "unverified"
+    if _informative_unverified(answer_report, objective, criteria_text):
+        return "partial"
+    return "verified_pass"
+
+
+# ============================================================
+# Construction
+# ============================================================
+
+_PLAN_STOPWORDS = {
+    "with", "from", "that", "this", "then", "must", "will", "the", "and", "for",
+    "not", "are", "has", "was", "should", "each", "its", "into", "than", "they",
+    "check", "verify", "ensure", "make", "sure", "be", "of", "to", "a",
+    "an", "in", "on", "by",
+}
+
+
+def _assign_plan(node: DAGNode, task_spec: TaskSpec) -> None:
+    """Assign relevant items from the global TaskSpec verification plan."""
+    if not task_spec.verification_plan:
+        return
+    haystack = f"{node.objective} {node.acceptance_criteria}".lower()
+
+    def relevant(item: str) -> bool:
+        words = [w for w in re.findall(r"[a-z]+", item.lower()) if len(w) > 3 and w not in _PLAN_STOPWORDS]
+        return bool(words) and any(w in haystack for w in words)
+
+    matched = [i for i in task_spec.verification_plan if relevant(i)]
+    node.verification_plan = matched or list(task_spec.verification_plan)
 
 
 def build_dag(task_spec: TaskSpec) -> list[DAGNode]:
     """Build DAG nodes from TaskSpec subtasks, topologically sorted.
 
-    Unknown dependency ids are dropped; the visited set keeps the sort from
-    hanging on cycles.
+    Raises DagValidationError on duplicate ids, cycles, self-dependencies or
+    unknown dependencies — invalid graphs are never silently tolerated.
     """
-    subtasks = {s.id: s for s in task_spec.subtasks}
+    errors = validate_dag(task_spec)
+    if errors:
+        raise DagValidationError("invalid DAG: " + "; ".join(errors))
+
     nodes = {
         s.id: DAGNode(
             id=s.id,
             objective=s.description,
-            depends_on=[d for d in s.depends_on if d in subtasks],
+            depends_on=list(s.depends_on),
             acceptance_criteria=s.acceptance_criteria,
         )
         for s in task_spec.subtasks
     }
+
+    for node in nodes.values():
+        _assign_plan(node, task_spec)
 
     visited: set[str] = set()
     order: list[str] = []
@@ -73,6 +290,11 @@ def build_dag(task_spec: TaskSpec) -> list[DAGNode]:
         visit(s.id)
 
     return [nodes[nid] for nid in order]
+
+
+# ============================================================
+# Execution
+# ============================================================
 
 
 def _node_prompt(node: DAGNode, context_text: str) -> str:
@@ -129,13 +351,15 @@ async def execute_node(
     node: DAGNode,
     dag_cfg: DagConfig,
     context_text: str,
+    risk_level: str = "medium",
 ) -> None:
-    """Run 1 primary agent; on verification failure, up to max_alternates.
+    """Run 1 primary agent with expansion policy:
 
-    Node passes when verification reports no failures. Unverified items do
-    not trigger an alternate (consistent with the fixed pipeline's repair
-    semantics — repair only on failures).
+    - failed → run one alternate (max 1)
+    - unverified/partial → run an alternate only for medium/high-risk nodes
+    - verified_pass → stop
     """
+    node.risk_level = risk_level
     solvers = ctx.policy.solver_configs
     primary = solvers[0] if solvers else AgentConfig(
         name="solver", role=AgentRole.SOLVER, model=dag_cfg.primary_model,
@@ -148,7 +372,7 @@ async def execute_node(
     attempt_label = "primary"
     cfg = primary
 
-    while attempts_left > 0 and node.status != "passed":
+    while attempts_left > 0:
         attempts_left -= 1
         node.attempts += 1
         content = await _run_attempt(client, ctx, node, cfg, context_text, attempt_label)
@@ -156,37 +380,40 @@ async def execute_node(
         if not content:
             node.status = "failed"
             node.error = "call failed or budget exhausted"
-            ctx.add_trace(f"DAG node {node.id} attempt {attempt_label}: failed ({node.error})")
+            ctx.add_trace(f"DAG node {node.id} attempt {attempt_label}: FAILED ({node.error})")
+        else:
+            node.result = content
+            answer_report = await verify_answer(content, node.objective, ctx.policy.verification_timeout)
+            node.verification = answer_report
+            criteria = [node.acceptance_criteria] if node.acceptance_criteria else []
+            node.acceptance = check_acceptance(content, criteria)
+            node.status = node_status(answer_report, node.acceptance, node.objective, " ".join(criteria))
+            ctx.add_trace(
+                f"DAG node {node.id} attempt {attempt_label}: {node.status} "
+                f"({answer_report.status}, {len(answer_report.results)} checks)"
+            )
+            if node.status == "failed":
+                node.error = "; ".join(answer_report.failures) or "acceptance criteria failed"
+
+        if node.status == "verified_pass":
             return
 
-        report = await verify_answer(content, node.objective, ctx.policy.verification_timeout)
-        node.result = content
-        node.verification = report
-
-        if report.has_failures:
-            ctx.add_trace(
-                f"DAG node {node.id} attempt {attempt_label}: verification FAILED — {report.failures}"
-            )
-            if attempts_left > 0:
-                attempt_label = "alternate"
-                cfg = alternates[min(node.alternates_used, len(alternates) - 1)]
-                node.alternates_used += 1
-            else:
-                node.status = "failed"
-                node.error = "; ".join(report.failures)
+        should_retry = node.status == "failed" or (
+            node.status in ("unverified", "partial") and risk_level in ("medium", "high")
+        )
+        if attempts_left > 0 and should_retry:
+            attempt_label = "alternate"
+            cfg = alternates[min(node.alternates_used, len(alternates) - 1)]
+            node.alternates_used += 1
         else:
-            node.status = "passed"
-            ctx.add_trace(
-                f"DAG node {node.id} attempt {attempt_label}: PASSED "
-                f"({report.status}, {len(report.results)} checks)"
-            )
+            return
 
 
 async def synthesize_dag_outputs(client: RouterClient, ctx: RunContext, nodes: list[DAGNode]) -> str:
-    """Global synthesis: combine node outputs into the final answer."""
+    """Global synthesis: combine acceptable node outputs into the final answer."""
     node_text = "\n\n".join(
         f"--- {n.id}: {n.objective} ---\n{n.result[:2000]}"
-        for n in nodes if n.result
+        for n in nodes if n.completed_acceptably
     )
     synth_cfg = ctx.policy.synthesizer_config
     if synth_cfg is None:
@@ -230,8 +457,8 @@ Note any subtask that failed or was skipped."""
 async def execute_dag(client: RouterClient, ctx: RunContext, dag_cfg: DagConfig) -> None:
     """Execute the TaskSpec subtask DAG, mutating ctx with the final answer.
 
-    Sequential over nodes in topological order. The shared ExecutionBudget
-    (with the DAG's limits) bounds total model calls and concurrency.
+    Raises DagValidationError on an invalid graph — the caller falls back
+    to the fixed pipeline.
     """
     if ctx.task_spec is None or not ctx.task_spec.subtasks:
         ctx.add_trace("DAG skipped — no subtasks in task spec")
@@ -250,30 +477,49 @@ async def execute_dag(client: RouterClient, ctx: RunContext, dag_cfg: DagConfig)
     )
     ctx.budget._semaphore = asyncio.Semaphore(dag_cfg.max_concurrent_calls)
 
-    nodes = build_dag(ctx.task_spec)
+    nodes = build_dag(ctx.task_spec)  # raises DagValidationError on invalid graphs
+    ctx.dag_nodes = nodes
     ctx.add_trace(f"DAG: {len(nodes)} subtask(s) in order: {', '.join(n.id for n in nodes)}")
 
+    dep_status: dict[str, str] = {}
     results: dict[str, str] = {}
+
     for node in nodes:
+        bad = [d for d in node.depends_on if dep_status.get(d) not in ("verified_pass", "partial")]
+        if bad:
+            node.status = "blocked"
+            node.error = f"required dependency '{bad[0]}' not acceptable ({dep_status.get(bad[0], 'missing')})"
+            ctx.add_trace(f"DAG node {node.id}: BLOCKED — {node.error}")
+            dep_status[node.id] = "blocked"
+            continue
+
+        # Only acceptable dependency outputs are fed forward as context
         dep_text = "\n\n".join(
-            f"--- {d} ---\n{results[d][:1000]}" for d in node.depends_on if d in results
+            f"--- {d} ---\n{results[d][:1000]}"
+            for d in node.depends_on if d in results
         )
         context_text = f"Original problem: {ctx.raw_prompt}\n\n{dep_text}".rstrip()
-        await execute_node(client, ctx, node, dag_cfg, context_text)
-        results[node.id] = node.result
+        await execute_node(client, ctx, node, dag_cfg, context_text, ctx.task_spec.risk_level)
+        dep_status[node.id] = node.status
+        if node.completed_acceptably:
+            results[node.id] = node.result
 
     ctx.candidates = [
         Candidate(
             name=f"dag:{node.id}",
             model="dag",
             content=node.result,
-            error=node.error if node.status == "failed" else "",
+            error=node.error if node.status in ("failed", "blocked") else "",
         )
         for node in nodes
     ]
+    counts = {
+        s: sum(1 for n in nodes if n.status == s)
+        for s in ("verified_pass", "partial", "unverified", "failed", "blocked")
+    }
     ctx.add_trace(
-        f"DAG done: {sum(1 for n in nodes if n.status == 'passed')} passed, "
-        f"{sum(1 for n in nodes if n.status == 'failed')} failed"
+        f"DAG done: {counts['verified_pass']} verified_pass, {counts['partial']} partial, "
+        f"{counts['unverified']} unverified, {counts['failed']} failed, {counts['blocked']} blocked"
     )
 
     ctx.answer = await synthesize_dag_outputs(client, ctx, nodes)

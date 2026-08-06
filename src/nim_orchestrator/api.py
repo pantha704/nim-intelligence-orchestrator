@@ -109,12 +109,18 @@ async def handle_intelligence_request(
     ctx.add_trace(f"Policy: action={ctx.policy.action}, route={ctx.policy.route}, reason={ctx.policy.reason}")
 
     if ctx.policy.action == "dag" or ctx.policy.use_dag:
-        from .dag import execute_dag
+        from .dag import DagValidationError, execute_dag
 
         ctx.add_trace(f"Adaptive DAG — {ctx.policy.route}")
-        await execute_dag(client, ctx, settings.dag)
-        ctx.finish()
-        return ctx.to_response()
+        try:
+            await execute_dag(client, ctx, settings.dag)
+            ctx.finish()
+            return ctx.to_response()
+        except DagValidationError as e:
+            ctx.add_trace(f"DAG invalid — falling back to fixed pipeline: {e}")
+            ctx.policy.action = "full"
+            ctx.policy.should_run_full_pipeline = True
+        # fall through to the full pipeline
 
     if ctx.policy.action == "speculative":
         accepted = await engine.execute_speculative(ctx, client)
