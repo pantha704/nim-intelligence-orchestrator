@@ -29,6 +29,12 @@ def main():
     bench4_parser.add_argument("--repeats", type=int, default=3)
     bench4_parser.add_argument("--limit", type=int, default=None,
                                help="Only run the first N cases (smoke testing)")
+    bench4_parser.add_argument("--per-category-limit", type=int, default=None,
+                               help="Run N cases per category (stratified smoke)")
+    bench4_parser.add_argument("--sealed-path", default=None,
+                               help="External/private sealed dataset path (recommended for sealed runs)")
+    bench4_parser.add_argument("--unrestricted", action="store_true",
+                               help="Second leaderboard: each mode uses its natural limits")
     bench4_parser.add_argument("--no-resume", action="store_true",
                                help="Do not skip already-completed trials")
     bench4_parser.add_argument("--out", default="artifacts")
@@ -105,9 +111,12 @@ def main():
         result = main_live(
             split=args.split,
             limit=args.limit,
+            per_category_limit=args.per_category_limit,
             repeats=args.repeats,
             out_dir=args.out,
             resume=not args.no_resume,
+            sealed_path=args.sealed_path,
+            unrestricted=args.unrestricted,
         )
         print("\n" + "=" * 60, file=sys.stderr)
         print("  Phase 4.3 summary", file=sys.stderr)

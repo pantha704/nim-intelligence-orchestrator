@@ -150,6 +150,26 @@ def semantic_value_present(answer: str, expected_value: str) -> tuple[str, str]:
     return "unverified", "answer contains no numbers to compare"
 
 
+def semantic_text_present(answer: str, expected_text: str) -> tuple[str, str]:
+    """Check expected text appears in an AFFIRMATIVE sentence.
+
+    A wrong or negated statement can never satisfy a criterion:
+    - verified: expected text in an affirmative sentence
+    - failed: expected text appears only in negated sentences
+    - unverified: expected text absent
+    """
+    expected = expected_text.strip().lower()
+    if not expected:
+        return "unverified", "empty expectation"
+    claims = extract_claims(answer)
+    for c in claims:
+        if expected in c.text.lower():
+            if c.negated:
+                return "failed", f"'{expected_text}' appears only in a negated claim: '{c.text[:80]}'"
+            return "verified", f"'{expected_text}' stated affirmatively"
+    return "unverified", f"'{expected_text}' not found in the answer"
+
+
 def extract_factual_claims(answer: str) -> list[dict]:
     """Claim extraction for research: sentences with subject-like content."""
     claims = []

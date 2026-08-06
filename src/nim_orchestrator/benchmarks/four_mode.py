@@ -1,4 +1,4 @@
-"""Phase 4.3 — reproducible four-mode benchmark and routing decision.
+"""Phase 4.3/4.3.1 — reproducible four-mode benchmark and routing decision.
 
 Modes:
   A. direct                  — one chat call
@@ -6,20 +6,29 @@ Modes:
   C. adaptive_dag            — DAG without specialists
   D. adaptive_dag_specialists — DAG + specialists + tools
 
-Scoring rules:
-- deterministic tools and executable tests outrank model judges;
-- UNVERIFIED is never counted as correct; unavailable verification is
-  reported separately;
-- open-ended categories use a blinded rubric with randomized mode labels;
-- benchmark answers/expected values never enter agent prompts;
-- every trial is appended to a JSONL so runs resume without duplicating
-  completed trials; commit/config/models/environment recorded per run.
+Validity rules (4.3.1):
+- stable SHA-256-derived seeds; seed_supported=False when the model API
+  cannot accept seeds — reproducibility is never claimed from metadata alone;
+- all modes run under one identical benchmark budget (or optionally each
+  with its natural limits on a second, explicitly-labeled leaderboard);
+- sandbox invocations come from a real execution counter; budget_exhausted
+  is set only on explicit reservation denials;
+- terminology: deterministic_verified_correct for testable tasks,
+  rubric_success (coverage AND blinded judge threshold) for prose tasks;
+  keyword coverage alone is never correctness;
+- results are event-based and append-only; every event carries run_id,
+  split, dataset checksum, commit, config hash, modes, budgets and an
+  environment fingerprint; resume and aggregation stay within the matching
+  run configuration;
+- sealed evaluation loads from an external/private path when provided and
+  its policy output is flagged advisory-only.
 """
 import asyncio
 import hashlib
 import json
 import platform
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -30,22 +39,40 @@ from pathlib import Path
 
 from ..api import handle_intelligence_request
 from ..budget import BudgetLimits, ExecutionBudget
-from ..config import DagConfig, Settings, load_settings
+from ..config import DagConfig, Settings
 from ..context import PolicyResult, RunContext
 from ..router_client import RouterClient, budgeted_chat
 from ..verifiers.registry import run_specialist_verification
-from ..verifiers.sandbox import select_secure_backend
-from ..verifiers.semantic_checks import semantic_value_present, verify_math_claims
-from .dataset import DatasetError, load_cases  # noqa: F401  (re-exported)
+from ..verifiers.sandbox import sandbox_run_count, select_secure_backend
+from ..verifiers.semantic_checks import (
+    semantic_text_present,
+    semantic_value_present,
+    verify_math_claims,
+)
+from .dataset import DatasetError
 
 MODES = ("direct", "fixed_pipeline", "adaptive_dag", "adaptive_dag_specialists")
-RUBRIC_CATEGORIES = {"systems_architecture", "security_review"}
+# open-ended/prose categories: correctness requires coverage AND blinded rubric
+RUBRIC_CATEGORIES = {"systems_architecture", "security_review", "factual_research"}
+DETERMINISTIC_CATEGORIES = {
+    "arithmetic", "coding", "debugging", "compound", "ambiguous",
+    "adversarial", "factual_control",
+}
 FORCE_MODE = {
     "direct": "single",
     "fixed_pipeline": "full",
     "adaptive_dag": "dag",
     "adaptive_dag_specialists": "dag",
 }
+RUBRIC_THRESHOLD = 7.0
+
+# Identical budget for every mode in the equal-budget leaderboard
+BENCHMARK_BUDGET = BudgetLimits(
+    max_model_calls=20,
+    max_time_seconds=120.0,
+    max_concurrent_agents=6,
+    max_total_agents=10,
+)
 
 
 @dataclass
@@ -56,9 +83,12 @@ class TrialOutcome:
     case_id: str
     question: str
     answer: str
-    verified_correct: bool | None = None  # True/False; None = not determinable
-    acceptance_complete: bool | None = None
-    verification_status: str = "unverified"  # passed|failed|partial|unverified|unavailable
+    run_id: str = ""
+    seed: int = 0
+    seed_supported: bool = False
+    deterministic_verified_correct: bool | None = None
+    deterministic_met: bool | None = None  # coverage/checklist gate for prose
+    verification_status: str = "unverified"  # passed|failed|partial|unverified|unavailable|judged
     failure_reason: str = ""
     latency_ms: float = 0.0
     model_calls: int = 0
@@ -67,7 +97,6 @@ class TrialOutcome:
     alternates_used: int = 0
     sandbox_invocations: int = 0
     budget_exhausted: bool = False
-    judge_score: float | None = None
     raw_trace: list[str] = field(default_factory=list)
     verification_records: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
@@ -76,8 +105,9 @@ class TrialOutcome:
         return {
             "trial_id": self.trial_id, "mode": self.mode, "category": self.category,
             "case_id": self.case_id, "question": self.question, "answer": self.answer,
-            "verified_correct": self.verified_correct,
-            "acceptance_complete": self.acceptance_complete,
+            "run_id": self.run_id, "seed": self.seed, "seed_supported": self.seed_supported,
+            "deterministic_verified_correct": self.deterministic_verified_correct,
+            "deterministic_met": self.deterministic_met,
             "verification_status": self.verification_status,
             "failure_reason": self.failure_reason,
             "latency_ms": round(self.latency_ms, 1),
@@ -86,7 +116,6 @@ class TrialOutcome:
             "alternates_used": self.alternates_used,
             "sandbox_invocations": self.sandbox_invocations,
             "budget_exhausted": self.budget_exhausted,
-            "judge_score": self.judge_score,
             "raw_trace": self.raw_trace,
             "verification_records": self.verification_records,
             "metadata": self.metadata,
@@ -99,6 +128,26 @@ class TrialOutcome:
 
 def trial_id(case_id: str, mode: str, repeat: int) -> str:
     return f"{case_id}:{mode}:{repeat}"
+
+
+def stable_seed(case_id: str, seed_base: int, repeat: int) -> int:
+    """Process-stable seed derived from SHA-256 (never hash(), which varies
+    with PYTHONHASHSEED)."""
+    digest = hashlib.sha256(f"{seed_base}:{case_id}:{repeat}".encode()).hexdigest()
+    return int(digest[:12], 16)
+
+
+def run_id_for(commit: str, dataset: str, split: str, config: str, budget_key: str,
+               modes: tuple[str, ...], repeats: int, seed_base: int) -> str:
+    material = f"{commit}|{dataset}|{split}|{config}|{budget_key}|{modes}|{repeats}|{seed_base}"
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def budget_key(limits: BudgetLimits | None) -> str:
+    if limits is None:
+        return "unrestricted"
+    return (f"calls{limits.max_model_calls}-time{limits.max_time_seconds:g}-"
+            f"conc{limits.max_concurrent_agents}-agents{limits.max_total_agents}")
 
 
 # ============================================================
@@ -126,6 +175,11 @@ def config_hash(settings: Settings) -> str:
         return "unknown"
 
 
+def environment_fingerprint(settings: Settings) -> str:
+    material = json.dumps(environment_info(settings), sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
 def environment_info(settings: Settings) -> dict:
     backend = select_secure_backend()
     return {
@@ -139,28 +193,25 @@ def environment_info(settings: Settings) -> dict:
 
 
 # ============================================================
-# Deterministic scoring
+# Deterministic scoring (pure, negation-aware)
 # ============================================================
-
-
-def _norm(text: str) -> str:
-    return " ".join(text.lower().split())
 
 
 def score_answer(case: dict, answer: str) -> dict:
     """Deterministic per-case scoring (pure — no model calls).
 
-    Returns {verified_correct, acceptance_complete, verification_status,
-    failure_reason, records}.
+    Returns {deterministic_verified_correct, deterministic_met,
+    verification_status, failure_reason, records}. Keyword coverage alone is
+    NEVER correctness — prose categories only produce deterministic_met.
     """
     check = case.get("check", "factual")
-    expected = [str(e).lower() for e in case.get("expected", [])]
+    expected = [str(e) for e in case.get("expected", [])]
     answer_l = answer.lower()
     records: list[dict] = []
 
     if not answer.strip():
         return {
-            "verified_correct": None, "acceptance_complete": False,
+            "deterministic_verified_correct": None, "deterministic_met": None,
             "verification_status": "unverified", "failure_reason": "empty answer",
             "records": records,
         }
@@ -169,22 +220,22 @@ def score_answer(case: dict, answer: str) -> dict:
         status, evidence, details = verify_math_claims(answer)
         records.append({"verifier": "math_semantic", "status": status, "evidence": evidence})
         if status == "fail":
-            return {"verified_correct": False, "acceptance_complete": False,
+            return {"deterministic_verified_correct": False, "deterministic_met": None,
                     "verification_status": "failed", "failure_reason": details, "records": records}
         for exp in expected:
             s, _ = semantic_value_present(answer, exp)
             if s == "verified":
-                return {"verified_correct": True, "acceptance_complete": True,
+                return {"deterministic_verified_correct": True, "deterministic_met": None,
                         "verification_status": "passed", "failure_reason": "", "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
-                "verification_status": "unverified", "failure_reason": "no verified equation matches expected",
-                "records": records}
+        return {"deterministic_verified_correct": None, "deterministic_met": None,
+                "verification_status": "unverified",
+                "failure_reason": "no verified equation matches expected", "records": records}
 
     if check in ("code", "debug"):
         syntax = run_specialist_verification(answer, "python_syntax", [], input_checked=case["id"])
         records.append({"verifier": "python_syntax", "status": syntax[0].status, "evidence": syntax[0].evidence})
         if syntax[0].status == "fail":
-            return {"verified_correct": False, "acceptance_complete": False,
+            return {"deterministic_verified_correct": False, "deterministic_met": None,
                     "verification_status": "failed", "failure_reason": syntax[0].evidence,
                     "records": records}
         tests = case.get("tests", "")
@@ -198,30 +249,36 @@ def score_answer(case: dict, answer: str) -> dict:
             records.append({"verifier": "test_runner", "status": tr.status, "evidence": tr.evidence})
         if tr is None or tr.status == "unverified":
             if tr is not None and "no test" in tr.evidence:
-                # case had no tests and syntax passed → nothing verifiable
-                return {"verified_correct": None, "acceptance_complete": False,
+                return {"deterministic_verified_correct": None, "deterministic_met": None,
                         "verification_status": "unverified",
                         "failure_reason": "syntax OK but no executable tests", "records": records}
             if tr is not None and ("refusing host" in tr.evidence or "no secure" in tr.evidence):
-                return {"verified_correct": None, "acceptance_complete": False,
+                return {"deterministic_verified_correct": None, "deterministic_met": None,
                         "verification_status": "unavailable",
                         "failure_reason": tr.evidence, "records": records}
         if tr.status == "pass":
-            return {"verified_correct": True, "acceptance_complete": True,
+            return {"deterministic_verified_correct": True, "deterministic_met": None,
                     "verification_status": "passed", "failure_reason": "", "records": records}
         if tr.status == "fail":
-            return {"verified_correct": False, "acceptance_complete": False,
+            return {"deterministic_verified_correct": False, "deterministic_met": None,
                     "verification_status": "failed", "failure_reason": tr.evidence,
                     "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
+        return {"deterministic_verified_correct": None, "deterministic_met": None,
                 "verification_status": "unverified", "failure_reason": tr.evidence, "records": records}
 
     if check == "factual":
+        # negation/context-aware: a wrong or negated statement can never pass
         for exp in expected:
-            if exp in answer_l:
-                return {"verified_correct": True, "acceptance_complete": True,
+            status, evidence = semantic_text_present(answer, exp)
+            records.append({"verifier": "semantic_text", "status": status, "evidence": evidence})
+            if status == "verified":
+                return {"deterministic_verified_correct": True, "deterministic_met": None,
                         "verification_status": "passed", "failure_reason": "", "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
+            if status == "failed":
+                return {"deterministic_verified_correct": False, "deterministic_met": None,
+                        "verification_status": "failed", "failure_reason": evidence,
+                        "records": records}
+        return {"deterministic_verified_correct": None, "deterministic_met": None,
                 "verification_status": "unverified",
                 "failure_reason": "expected value not found (absence is not contradiction)",
                 "records": records}
@@ -232,79 +289,97 @@ def score_answer(case: dict, answer: str) -> dict:
             answer, "coverage", [], requirements=reqs, input_checked=case["id"]
         )
         records.append({"verifier": "coverage", "status": cov[0].status, "evidence": cov[0].evidence})
-        if cov[0].status == "pass":
-            return {"verified_correct": True, "acceptance_complete": True,
-                    "verification_status": "passed", "failure_reason": "", "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
-                "verification_status": "unverified", "failure_reason": cov[0].evidence,
-                "records": records}
+        met = cov[0].status == "pass"
+        # coverage is a GATE, never correctness — rubric decides correctness
+        return {"deterministic_verified_correct": None, "deterministic_met": met,
+                "verification_status": "judged" if met else "unverified",
+                "failure_reason": "" if met else cov[0].evidence, "records": records}
 
     if check == "security":
         sec = run_specialist_verification(answer, "security_checklist", [], input_checked=case["id"])
         records.append({"verifier": "security_checklist", "status": sec[0].status, "evidence": sec[0].evidence})
-        if sec[0].status == "pass":
-            return {"verified_correct": True, "acceptance_complete": True,
-                    "verification_status": "passed", "failure_reason": "", "records": records}
         if sec[0].status == "fail":
-            return {"verified_correct": False, "acceptance_complete": False,
+            return {"deterministic_verified_correct": None, "deterministic_met": False,
                     "verification_status": "failed", "failure_reason": sec[0].evidence,
                     "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
-                "verification_status": "unverified", "failure_reason": sec[0].evidence,
-                "records": records}
+        met = sec[0].status == "pass"
+        return {"deterministic_verified_correct": None, "deterministic_met": met,
+                "verification_status": "judged" if met else "unverified",
+                "failure_reason": "" if met else sec[0].evidence, "records": records}
 
     if check == "compound":
-        matched = [e for e in expected if e in answer_l]
-        records.append({"verifier": "value_presence", "status": "pass" if matched else "unverified",
-                        "evidence": f"matched {len(matched)}/{len(expected)} expected values"})
-        if len(matched) == len(expected):
-            return {"verified_correct": True, "acceptance_complete": True,
+        matched = 0
+        for exp in expected:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", exp):
+                s, _ = semantic_value_present(answer, exp)
+            else:
+                s, _ = semantic_text_present(answer, exp)
+            if s == "verified":
+                matched += 1
+            elif s == "failed":
+                return {"deterministic_verified_correct": False, "deterministic_met": None,
+                        "verification_status": "failed", "failure_reason": f"contradicted: {exp}",
+                        "records": records}
+        records.append({"verifier": "semantic_multi", "status": "pass" if matched == len(expected) else "unverified",
+                        "evidence": f"matched {matched}/{len(expected)} expected values"})
+        if matched == len(expected):
+            return {"deterministic_verified_correct": True, "deterministic_met": None,
                     "verification_status": "passed", "failure_reason": "", "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
+        return {"deterministic_verified_correct": None, "deterministic_met": None,
                 "verification_status": "unverified",
-                "failure_reason": f"matched {len(matched)}/{len(expected)} expected values",
-                "records": records}
+                "failure_reason": f"matched {matched}/{len(expected)} expected values", "records": records}
 
     if check == "adversarial":
         trigger = str(case.get("trigger", "")).lower()
         if trigger and trigger in answer_l:
-            return {"verified_correct": False, "acceptance_complete": False,
+            return {"deterministic_verified_correct": False, "deterministic_met": None,
                     "verification_status": "failed",
                     "failure_reason": f"injection succeeded — trigger '{trigger}' present",
                     "records": [{"verifier": "injection", "status": "fail", "evidence": trigger}]}
         for exp in expected:
-            if exp in answer_l:
-                return {"verified_correct": True, "acceptance_complete": True,
-                        "verification_status": "passed",
-                        "failure_reason": "", "records": records}
-        return {"verified_correct": None, "acceptance_complete": False,
+            status, _ = semantic_text_present(answer, exp)
+            if status == "verified":
+                return {"deterministic_verified_correct": True, "deterministic_met": None,
+                        "verification_status": "passed", "failure_reason": "", "records": records}
+        return {"deterministic_verified_correct": None, "deterministic_met": None,
                 "verification_status": "unverified",
                 "failure_reason": "no trigger, but expected answer not found", "records": records}
 
-    # fallback (factual-like)
+    # fallback (factual-like, negation-aware)
     for exp in expected:
-        if exp in answer_l:
-            return {"verified_correct": True, "acceptance_complete": True,
+        status, _ = semantic_text_present(answer, exp)
+        if status == "verified":
+            return {"deterministic_verified_correct": True, "deterministic_met": None,
                     "verification_status": "passed", "failure_reason": "", "records": records}
-    return {"verified_correct": None, "acceptance_complete": False,
+    return {"deterministic_verified_correct": None, "deterministic_met": None,
             "verification_status": "unverified", "failure_reason": "no check matched",
             "records": records}
 
 
+_ASSUMPTION_RE = re.compile(
+    r"\b(?:i assume|assuming|assumptions?:|my assumption|we assume|we\'ll assume)\b",
+    re.IGNORECASE,
+)
+
+
 def score_ambiguous(response: dict, answer: str) -> dict:
-    """Ambiguous tasks: acceptable completion = clarification asked OR
-    explicit assumptions stated."""
+    """Ambiguous tasks: acceptable completion requires a REAL clarification
+    question OR structured, relevant assumptions — a bare 'assume' mention
+    is not enough."""
     if response.get("mode") == "needs_clarification":
-        return {"verified_correct": True, "acceptance_complete": True,
-                "verification_status": "passed", "failure_reason": "clarification asked",
-                "records": [{"verifier": "clarification", "status": "pass"}]}
-    if "assum" in answer.lower():
-        return {"verified_correct": True, "acceptance_complete": True,
-                "verification_status": "passed", "failure_reason": "assumptions stated",
+        q = response.get("clarification_question", "")
+        if q:
+            return {"deterministic_verified_correct": True, "deterministic_met": None,
+                    "verification_status": "passed", "failure_reason": "clarification asked",
+                    "records": [{"verifier": "clarification", "status": "pass", "evidence": q[:120]}]}
+    if _ASSUMPTION_RE.search(answer) and len(answer.strip()) >= 40:
+        return {"deterministic_verified_correct": True, "deterministic_met": None,
+                "verification_status": "passed", "failure_reason": "structured assumptions stated",
                 "records": [{"verifier": "assumptions", "status": "pass"}]}
-    return {"verified_correct": None, "acceptance_complete": False,
+    return {"deterministic_verified_correct": None, "deterministic_met": None,
             "verification_status": "unverified",
-            "failure_reason": "neither clarification nor assumptions", "records": []}
+            "failure_reason": "no clarification question and no structured assumptions",
+            "records": []}
 
 
 # ============================================================
@@ -375,8 +450,6 @@ def _extract_scores(content: str) -> dict[str, float] | None:
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        import re
-
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
             return None
@@ -414,40 +487,43 @@ def _dag_config_for(mode: str, settings: Settings) -> DagConfig:
 
 
 async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: str,
-                    repeat: int, seed: int) -> TrialOutcome:
+                    repeat: int, *, run_id: str, seed: int,
+                    budget_limits: BudgetLimits | None) -> TrialOutcome:
     question = case["question"]
+    sandbox_before = sandbox_run_count()
     t0 = time.monotonic()
     try:
         dag_config = None if mode == "fixed_pipeline" else _dag_config_for(mode, settings)
         response = await handle_intelligence_request(
             client, settings, question,
             force_mode=FORCE_MODE[mode], dag_config=dag_config,
+            budget_limits=budget_limits,
         )
         latency_ms = (time.monotonic() - t0) * 1000
         answer = response.get("answer", "") or ""
         transport_error = str(response.get("error") or "")
+        trace = response.get("pipeline_trace", []) or []
 
         if case.get("check") == "ambiguous":
             scored = score_ambiguous(response, answer)
         else:
             scored = score_answer(case, answer)
-        # judge score for prose categories (deterministic still outranks)
-        judge_score = None
-        if case.get("category") in RUBRIC_CATEGORIES and case.get("check") != "ambiguous":
-            judge_score = response.get("_judge_score")
 
         budget = response.get("budget", {})
         call_log = budget.get("call_log", [])
         timeouts = sum(1 for e in call_log if e.get("status") == "timeout")
-        budget_exhausted = bool(budget.get("model_calls", 0) >= budget.get("limits", {}).get("max_model_calls", 10**9))
-        alternates = sum(1 for t in response.get("pipeline_trace", []) if "alternate" in t.lower() and "attempt" in t.lower())
+        # explicit denial events only — never infer from call count equality
+        budget_exhausted = any("budget exhausted" in t.lower() for t in trace)
+        alternates = sum(1 for t in trace if "alternate" in t.lower() and "attempt" in t.lower())
+        sandbox_invocations = sandbox_run_count() - sandbox_before
 
         return TrialOutcome(
             trial_id=trial_id(case["id"], mode, repeat),
             mode=mode, category=case["category"], case_id=case["id"],
             question=question, answer=answer,
-            verified_correct=scored["verified_correct"],
-            acceptance_complete=scored["acceptance_complete"],
+            run_id=run_id, seed=seed, seed_supported=False,
+            deterministic_verified_correct=scored["deterministic_verified_correct"],
+            deterministic_met=scored["deterministic_met"],
             verification_status=scored["verification_status"],
             failure_reason=scored["failure_reason"],
             latency_ms=latency_ms,
@@ -455,10 +531,9 @@ async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: 
             timed_out=timeouts > 0,
             transport_error=transport_error,
             alternates_used=alternates,
-            sandbox_invocations=0,
+            sandbox_invocations=sandbox_invocations,
             budget_exhausted=budget_exhausted,
-            judge_score=judge_score,
-            raw_trace=response.get("pipeline_trace", []),
+            raw_trace=trace,
             verification_records=scored["records"],
         )
     except Exception as e:
@@ -466,7 +541,8 @@ async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: 
             trial_id=trial_id(case["id"], mode, repeat),
             mode=mode, category=case["category"], case_id=case["id"],
             question=question, answer="",
-            verified_correct=None, acceptance_complete=False,
+            run_id=run_id, seed=seed, seed_supported=False,
+            deterministic_verified_correct=None, deterministic_met=None,
             verification_status="unverified",
             failure_reason=f"request crashed: {type(e).__name__}: {e}",
             latency_ms=(time.monotonic() - t0) * 1000,
@@ -476,60 +552,91 @@ async def run_trial(client: RouterClient, settings: Settings, case: dict, mode: 
 
 
 # ============================================================
-# Persistence / resumption
+# Persistence / resumption (append-only, run-isolated)
 # ============================================================
 
 
-def load_existing_trial_ids(results_path: Path) -> set[str]:
+def load_events(results_path: Path, run_id: str | None = None) -> list[dict]:
     if not results_path.exists():
-        return set()
-    ids = set()
+        return []
+    events = []
     for line in results_path.read_text().splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if run_id is not None and record.get("run_id") != run_id:
+            continue
+        events.append(record)
+    return events
+
+
+def load_existing_trial_ids(results_path: Path, run_id: str) -> set[str]:
+    ids = set()
+    for record in load_events(results_path, run_id):
         if record.get("kind") == "trial" and record.get("trial_id"):
             ids.add(record["trial_id"])
     return ids
 
 
-def load_trials(results_path: Path) -> list[TrialOutcome]:
+def load_trials(results_path: Path, run_id: str) -> list[TrialOutcome]:
     trials = []
-    if not results_path.exists():
-        return trials
-    for line in results_path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for record in load_events(results_path, run_id):
         if record.get("kind") == "trial":
             trials.append(TrialOutcome.from_dict(record))
     return trials
 
 
-def load_judge_records(results_path: Path) -> list[dict]:
-    records = []
-    if not results_path.exists():
-        return records
-    for line in results_path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("kind") == "judge":
-            records.append(record)
-    return records
+def load_judge_events(results_path: Path, run_id: str) -> list[dict]:
+    return [r for r in load_events(results_path, run_id) if r.get("kind") == "judge"]
 
 
 # ============================================================
-# Aggregation
+# Aggregation (rubric joined from judge events)
 # ============================================================
+
+
+def _judge_map(judge_events: list[dict]) -> dict[tuple[str, int, str], float]:
+    mapping: dict[tuple[str, int, str], float] = {}
+    for event in judge_events:
+        case_id = event.get("case_id")
+        repeat = event.get("repeat")
+        scores = event.get("scores", {})
+        for mode, score in scores.items():
+            if isinstance(score, (int, float)):
+                mapping[(case_id, repeat, mode)] = float(score)
+    return mapping
+
+
+def effective_correct(outcome: TrialOutcome, judge_scores: dict[tuple[str, int, str], float]) -> tuple[bool | None, str]:
+    """Effective correctness for a trial.
+
+    Deterministic categories: deterministic_verified_correct.
+    Rubric categories: rubric_success = deterministic gate met AND blinded
+    judge score >= threshold. Missing judge → unverified (not correct).
+    """
+    if outcome.category in RUBRIC_CATEGORIES:
+        score = judge_scores.get((outcome.case_id, _repeat_of(outcome.trial_id), outcome.mode))
+        if score is None:
+            return None, "unverified"
+        if outcome.deterministic_met is not True:
+            return False, "failed"
+        if score >= RUBRIC_THRESHOLD:
+            return True, "judged"
+        return False, "judged"
+    return outcome.deterministic_verified_correct, outcome.verification_status
+
+
+def _repeat_of(trial_id: str) -> int:
+    try:
+        return int(trial_id.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return 0
 
 
 def _pct(values: list[bool | None]) -> float | None:
-    """Fraction of values that are True over ALL values — None (unverified)
-    and False (failed) both count as not correct."""
+    """Fraction True over ALL values — None (unverified) and False (failed)
+    both count as not correct."""
     if not values:
         return None
     return sum(1 for v in values if v) / len(values)
@@ -543,26 +650,38 @@ def _percentile(values: list[float], p: float) -> float | None:
     return statistics.quantiles(sorted(values), n=100, method="inclusive")[int(p) - 1]
 
 
-def summarize_trials(trials: list[TrialOutcome]) -> dict:
-    """Aggregate globally and per (mode, category)."""
+def summarize_trials(trials: list[TrialOutcome], judge_events: list[dict] | None = None) -> dict:
+    """Aggregate globally and per (mode, category). Rubric categories join
+    their blinded judge scores; keyword coverage alone is never correctness."""
+    judge_scores = _judge_map(judge_events or [])
     summary: dict[str, dict] = {}
 
-    def _agg(name: str, group: list[TrialOutcome]) -> dict:
+    def _agg(mode: str, group: list[TrialOutcome]) -> dict:
         n = len(group)
         if n == 0:
             return {"n": 0}
-        verified = [t.verified_correct for t in group]
+        effective = [effective_correct(t, judge_scores) for t in group]
+        correct = [e for e, _ in effective]
         latencies = [t.latency_ms for t in group if t.latency_ms]
         return {
             "n": n,
-            "verified_correct_rate": _pct(verified),
-            "acceptance_complete_rate": _pct([t.acceptance_complete for t in group]),
+            "verified_correct_rate": _pct(correct),
+            "deterministic_rate": _pct([t.deterministic_verified_correct for t in group]),
+            "rubric_success_rate": _pct(
+                [c for (c, s), t in zip(effective, group) if t.category in RUBRIC_CATEGORIES]
+            ),
+            "acceptance_complete_rate": _pct([c for c, _ in effective]),
             "failed_verification_rate": sum(1 for t in group if t.verification_status == "failed") / n,
-            "unverified_claim_rate": sum(1 for t in group if t.verification_status in ("unverified", "unavailable")) / n,
-            "unavailable_verification_rate": sum(1 for t in group if t.verification_status == "unavailable") / n,
+            "unverified_claim_rate": sum(
+                1 for (_, s), t in zip(effective, group)
+                if s == "unverified" or t.verification_status in ("unverified", "unavailable")
+            ) / n,
+            "unavailable_verification_rate": sum(
+                1 for t in group if t.verification_status == "unavailable"
+            ) / n,
             "complete_task_success_rate": sum(
-                1 for t in group
-                if t.verified_correct is True and t.verification_status != "unavailable"
+                1 for c, t in zip(correct, group)
+                if c is True and t.verification_status != "unavailable"
                 and not t.transport_error and not t.timed_out
             ) / n,
             "latency_ms_p50": _percentile(latencies, 50),
@@ -574,8 +693,6 @@ def summarize_trials(trials: list[TrialOutcome]) -> dict:
             "alternate_activation_rate": sum(1 for t in group if t.alternates_used > 0) / n,
             "total_sandbox_invocations": sum(t.sandbox_invocations for t in group),
             "budget_exhaustion_rate": sum(1 for t in group if t.budget_exhausted) / n,
-            "judge_score_mean": round(statistics.mean([t.judge_score for t in group if t.judge_score is not None]), 2)
-            if any(t.judge_score is not None for t in group) else None,
         }
 
     for mode in MODES:
@@ -589,6 +706,7 @@ def summarize_trials(trials: list[TrialOutcome]) -> dict:
         "total_trials": len(trials),
         "categories": sorted({t.category for t in trials}),
         "modes": MODES,
+        "judge_events": len(judge_events or []),
     }
     return summary
 
@@ -604,13 +722,15 @@ PROMOTION_EQUIVALENCE_PP = 0.05
 PROMOTION_TIMEOUT_SLACK = 0.05
 
 
-def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline") -> dict:
+def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline",
+                         sealed: bool = False) -> dict:
     """Per-category routing decisions from measured results.
 
     DAG specialists are promoted for a category only when they improve
     verified correctness by >= 10pp, or achieve equivalent correctness with
     >= 25% lower latency/calls, with no meaningful timeout regression and
-    enough completed trials.
+    enough completed trials. For open-ended categories the decision uses the
+    rubric success rate (coverage AND blinded judge threshold).
     """
     rules = []
     notes = []
@@ -626,9 +746,11 @@ def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline") -> dic
         if not rows:
             continue
 
+        rate_key = "rubric_success_rate" if cat in RUBRIC_CATEGORIES else "verified_correct_rate"
+
         if cat == "ambiguous":
             rules.append({"category": cat, "mode": "clarification",
-                          "rationale": "ambiguous tasks ask one clarifying question (or state assumptions)"})
+                          "rationale": "ambiguous tasks ask one clarifying question (or state structured assumptions)"})
             continue
 
         fixed = rows.get(baseline)
@@ -639,35 +761,33 @@ def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline") -> dic
         best_rate = -1.0
         best_mode = baseline
         for mode, row in rows.items():
-            rate = row.get("verified_correct_rate")
-            if rate is not None and rate > best_rate:
-                best_rate = rate
-                best_mode = mode
-            elif rate is not None and rate == best_rate:
+            rate = row.get(rate_key)
+            if rate is None:
+                continue
+            if rate > best_rate:
+                best_rate, best_mode = rate, mode
+            elif rate == best_rate:
                 if row.get("latency_ms_p50", float("inf")) < rows[best_mode].get("latency_ms_p50", float("inf")):
                     best_mode = mode
 
         if cat == "factual_control":
             direct = rows.get("direct")
-            if direct and fixed and direct.get("verified_correct_rate", 0) >= fixed.get("verified_correct_rate", 1) - PROMOTION_EQUIVALENCE_PP:
-                chosen = "direct"
-                rationale = "simple factual — direct matches or beats fixed pipeline"
-            elif direct and fixed is None:
-                chosen = "direct"
-                rationale = "simple factual — direct only measured mode"
+            fixed_rate = fixed.get(rate_key) if fixed else None
+            direct_rate = direct.get(rate_key) if direct else None
+            if direct and fixed and direct_rate is not None and fixed_rate is not None \
+                    and direct_rate >= fixed_rate - PROMOTION_EQUIVALENCE_PP:
+                chosen, rationale = "direct", "simple factual — direct matches or beats fixed pipeline"
             elif best_mode == "direct":
-                chosen = "direct"
-                rationale = "simple factual — direct measured best"
+                chosen, rationale = "direct", "simple factual — direct measured best"
             else:
-                chosen = baseline
-                rationale = "simple factual — direct did not match fixed pipeline"
+                chosen, rationale = baseline, "simple factual — direct did not match fixed pipeline"
             rules.append({"category": cat, "mode": chosen, "rationale": rationale})
             continue
 
         if dag_spec and fixed:
             n = dag_spec.get("n", 0)
             if n >= PROMOTION_MIN_TRIALS:
-                improve = (dag_spec.get("verified_correct_rate") or 0) - (fixed.get("verified_correct_rate") or 0)
+                improve = (dag_spec.get(rate_key) or 0) - (fixed.get(rate_key) or 0)
                 fixed_lat = fixed.get("latency_ms_p50") or 1
                 latency_ratio = (dag_spec.get("latency_ms_p50") or fixed_lat) / fixed_lat
                 fixed_calls = fixed.get("mean_model_calls") or 1
@@ -679,15 +799,17 @@ def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline") -> dic
                     if timeout_regression <= PROMOTION_TIMEOUT_SLACK:
                         chosen = "adaptive_dag_specialists"
                         rationale = (
-                            f"promoted: verified {improve:+.0%} vs fixed; "
+                            f"promoted: {rate_key} {improve:+.0%} vs fixed; "
                             f"latency ratio {latency_ratio:.2f}; calls ratio {calls_ratio:.2f}"
                         )
                     else:
                         notes.append(f"{cat}: DAG specialists gained but timeout rate regressed +{timeout_regression:.0%}")
 
         if chosen == baseline and best_mode != baseline and best_mode != "adaptive_dag_specialists":
+            # DAG+specialists may only be chosen through explicit promotion
+            # criteria; the measured-best fallback applies to other modes.
             chosen = best_mode
-            rationale = f"measured best verified correctness ({best_rate:.0%})"
+            rationale = f"measured best {rate_key} ({best_rate:.0%})"
 
         rules.append({"category": cat, "mode": chosen, "rationale": rationale})
 
@@ -705,6 +827,9 @@ def build_routing_policy(summary: dict, baseline: str = "fixed_pipeline") -> dic
             "timeout_slack": PROMOTION_TIMEOUT_SLACK,
         },
         "limitation": "policy is advisory — production defaults are NOT modified automatically",
+        "sealed": sealed,
+        "sealed_note": ("sealed evaluation — policy is advisory only and must NOT be "
+                        "used to tune production routing") if sealed else None,
     }
 
 
@@ -717,31 +842,37 @@ def build_report(summary: dict, meta: dict, policy: dict) -> str:
     lines = [
         "# Phase 4.3 benchmark report",
         "",
+        f"- run_id: `{meta.get('run_id', 'unknown')}`",
         f"- commit: `{meta.get('commit', 'unknown')}`",
         f"- config hash: `{meta.get('config_hash', 'unknown')}`",
         f"- dataset: `{meta.get('dataset', '?')}` (checksum `{meta.get('dataset_checksum', '?')}`)",
+        f"- budget: `{meta.get('budget', '?')}`",
+        f"- seed base: `{meta.get('seed_base', '?')}` (seed_supported: false — model API has no seed)",
         f"- models: {', '.join(meta.get('environment', {}).get('models', []))}",
         f"- judge model: {meta.get('environment', {}).get('judge_model')}",
         f"- sandbox backend: {meta.get('environment', {}).get('sandbox_backend')}",
         f"- platform: {meta.get('environment', {}).get('platform')}",
         f"- generated: {meta.get('timestamp', '?')}",
         "",
+        "Terminology: open-ended categories (research/architecture/security) are scored by",
+        "rubric_success (deterministic coverage gate AND blinded judge >= 7); testable",
+        "categories by deterministic_verified_correct. UNVERIFIED never counts as correct.",
+        "",
         "## Global",
         "",
     ]
-    lines.append("| mode | n | verified | acceptance | failed | unverified | complete | p50 | p90 | calls | timeouts | transport | alternates | budget-exh |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| mode | n | correct | deterministic | rubric | failed | unverified | complete | p50 | calls | timeouts | budget-exh |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for mode in MODES:
         row = summary.get(mode, {}).get("overall", {})
         if not row.get("n"):
             continue
         lines.append(
             f"| {mode} | {row['n']} | {_fmt(row.get('verified_correct_rate'))} | "
-            f"{_fmt(row.get('acceptance_complete_rate'))} | {_fmt(row.get('failed_verification_rate'))} | "
-            f"{_fmt(row.get('unverified_claim_rate'))} | {_fmt(row.get('complete_task_success_rate'))} | "
-            f"{_fmt_ms(row.get('latency_ms_p50'))} | {_fmt_ms(row.get('latency_ms_p90'))} | "
+            f"{_fmt(row.get('deterministic_rate'))} | {_fmt(row.get('rubric_success_rate'))} | "
+            f"{_fmt(row.get('failed_verification_rate'))} | {_fmt(row.get('unverified_claim_rate'))} | "
+            f"{_fmt(row.get('complete_task_success_rate'))} | {_fmt_ms(row.get('latency_ms_p50'))} | "
             f"{_fmt(row.get('mean_model_calls'), 2)} | {_fmt(row.get('timeout_rate'))} | "
-            f"{_fmt(row.get('transport_error_rate'))} | {_fmt(row.get('alternate_activation_rate'))} | "
             f"{_fmt(row.get('budget_exhaustion_rate'))} |"
         )
     lines.append("")
@@ -749,7 +880,7 @@ def build_report(summary: dict, meta: dict, policy: dict) -> str:
     for cat in summary["_meta"]["categories"]:
         lines.append(f"## {cat}")
         lines.append("")
-        lines.append("| mode | n | verified | acceptance | failed | unverified | complete | p50 | calls |")
+        lines.append("| mode | n | correct | deterministic | rubric | failed | unverified | p50 | calls |")
         lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for mode in MODES:
             row = summary.get(mode, {}).get(cat, {})
@@ -757,8 +888,8 @@ def build_report(summary: dict, meta: dict, policy: dict) -> str:
                 continue
             lines.append(
                 f"| {mode} | {row['n']} | {_fmt(row.get('verified_correct_rate'))} | "
-                f"{_fmt(row.get('acceptance_complete_rate'))} | {_fmt(row.get('failed_verification_rate'))} | "
-                f"{_fmt(row.get('unverified_claim_rate'))} | {_fmt(row.get('complete_task_success_rate'))} | "
+                f"{_fmt(row.get('deterministic_rate'))} | {_fmt(row.get('rubric_success_rate'))} | "
+                f"{_fmt(row.get('failed_verification_rate'))} | {_fmt(row.get('unverified_claim_rate'))} | "
                 f"{_fmt_ms(row.get('latency_ms_p50'))} | {_fmt(row.get('mean_model_calls'), 2)} |"
             )
         lines.append("")
@@ -772,11 +903,16 @@ def build_report(summary: dict, meta: dict, policy: dict) -> str:
         lines.append("Notes:")
         for note in policy["notes"]:
             lines.append(f"- {note}")
+    if policy.get("sealed"):
+        lines.append("")
+        lines.append("**Sealed evaluation** — this policy is advisory only and must not be used to tune production.")
     lines.append("")
     lines.append("## Limitations")
     lines.append("")
     lines.append("- UNVERIFIED answers are never counted as correct.")
     lines.append("- Unavailable verification (e.g. no secure sandbox backend) is reported separately.")
+    lines.append("- The model API cannot accept seeds, so stochastic generations are not bit-reproducible;")
+    lines.append("  seeds are recorded per trial but marked seed_supported=false.")
     lines.append("- The blinded rubric uses the configured judge model; if it is the same family as the")
     lines.append("  generating models, self-preference is mitigated by randomized labels but not eliminated.")
     return "\n".join(lines)
@@ -804,26 +940,36 @@ async def run_benchmark4(
     settings: Settings,
     *,
     split: str = "dev",
+    sealed_path: str | None = None,
     modes: tuple[str, ...] = MODES,
     repeats: int = 3,
     out_dir: Path = Path("artifacts"),
     resume: bool = True,
     seed_base: int = 4242,
     case_limit: int | None = None,
+    per_category_limit: int | None = None,
     rubric: bool = True,
+    equal_budget: bool = True,
 ) -> dict:
     """Run the four-mode benchmark. Returns summary + policy."""
     from ..config import DEFAULT_CONFIG_DIR
     from .dataset import load_cases as _load
 
     if split == "dev":
-        path = DEFAULT_CONFIG_DIR / "benchmark_cases_v1.yaml"
+        path = Path(sealed_path) if sealed_path else DEFAULT_CONFIG_DIR / "benchmark_cases_v1.yaml"
+        min_per_cat = 10 if not sealed_path else 5
     elif split == "sealed":
-        path = DEFAULT_CONFIG_DIR / "benchmark_cases_v1_sealed.yaml"
+        path = Path(sealed_path) if sealed_path else DEFAULT_CONFIG_DIR / "benchmark_cases_v1_sealed.yaml"
+        min_per_cat = 5
     else:
         raise DatasetError(f"unknown split '{split}' (use dev|sealed)")
-    cases = _load(path)
-    if case_limit:
+    cases = _load(path, min_per_category=min_per_cat)
+    if per_category_limit:
+        by_cat: dict[str, list[dict]] = {}
+        for c in cases:
+            by_cat.setdefault(c["category"], []).append(c)
+        cases = [c for cat in sorted(by_cat) for c in by_cat[cat][:per_category_limit]]
+    elif case_limit:
         cases = cases[:case_limit]
 
     out_dir = Path(out_dir)
@@ -833,23 +979,36 @@ async def run_benchmark4(
         d.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "benchmark_results.jsonl"
 
+    limits = BENCHMARK_BUDGET if equal_budget else None
+    budget_key_s = budget_key(limits)
+    env = environment_info(settings)
+    commit = repo_commit()
+    cfg_hash = config_hash(settings)
+    checksum = _dataset_checksum(path)
+    run_id = run_id_for(commit, path.name, split, cfg_hash, budget_key_s, modes, repeats, seed_base)
+
     meta = {
-        "commit": repo_commit(),
-        "config_hash": config_hash(settings),
-        "environment": environment_info(settings),
+        "run_id": run_id,
+        "commit": commit,
+        "config_hash": cfg_hash,
+        "environment": env,
+        "environment_fingerprint": environment_fingerprint(settings),
         "dataset": path.name,
-        "dataset_checksum": _dataset_checksum(path),
+        "dataset_checksum": checksum,
+        "split": split,
         "modes": list(modes),
         "repeats": repeats,
         "seed_base": seed_base,
+        "seed_supported": False,
+        "budget": budget_key_s,
+        "equal_budget": equal_budget,
         "timestamp": datetime.now(UTC).isoformat(),
-        "sandbox_backend": select_secure_backend().name if select_secure_backend() else "none",
     }
     (out_dir / "benchmark_run_meta.json").write_text(json.dumps(meta, indent=2))
 
-    existing = load_existing_trial_ids(results_path) if resume else set()
+    existing = load_existing_trial_ids(results_path, run_id) if resume else set()
     judge_keys: set[str] = {
-        f"{r.get('case_id')}:{r.get('repeat')}" for r in load_judge_records(results_path)
+        f"{r.get('case_id')}:{r.get('repeat')}" for r in load_judge_events(results_path, run_id)
     }
 
     def _append(record: dict) -> None:
@@ -863,17 +1022,17 @@ async def run_benchmark4(
                 tid = trial_id(case["id"], mode, repeat)
                 if tid in existing:
                     continue
-                seed = seed_base + hash(case["id"]) % 10_000 + repeat * 7
-                outcome = await run_trial(client, settings, case, mode, repeat, seed)
+                seed = stable_seed(case["id"], seed_base, repeat)
+                outcome = await run_trial(client, settings, case, mode, repeat,
+                                          run_id=run_id, seed=seed, budget_limits=limits)
                 record = outcome.to_dict()
                 record["kind"] = "trial"
-                record["seed"] = seed
                 _append(record)
                 per_mode[mode] = outcome
-                if outcome.verified_correct is False or outcome.verification_status == "failed":
+                if outcome.deterministic_verified_correct is False or outcome.verification_status == "failed":
                     (failures_dir / f"{tid}.json").write_text(json.dumps(record, indent=2))
                 (traces_dir / f"{tid}.json").write_text(json.dumps({
-                    "trial_id": tid, "mode": mode, "case_id": case["id"],
+                    "trial_id": tid, "run_id": run_id, "mode": mode, "case_id": case["id"],
                     "raw_trace": outcome.raw_trace,
                     "verification_records": outcome.verification_records,
                     "answer": outcome.answer[:2000],
@@ -886,51 +1045,29 @@ async def run_benchmark4(
                 and case.get("check") != "ambiguous"
                 and jkey not in judge_keys
             ):
-                # gather answers from this run + previously completed trials
                 answers = {m: t.answer for m, t in per_mode.items() if t.answer}
-                existing_trials = [t for t in load_trials(results_path)
-                                   if t.case_id == case["id"] and t.mode in MODES and t.judge_score is None]
-                for t in existing_trials:
-                    if t.answer and t.mode not in answers:
-                        answers[t.mode] = t.answer
                 if len(answers) >= 2:
-                    seed = seed_base + hash(case["id"]) % 10_000 + repeat * 11
+                    seed = stable_seed(f"judge:{case['id']}", seed_base, repeat)
                     scores = await blind_rubric(client, settings, case["question"], answers, seed)
-                    _append({"kind": "judge", "case_id": case["id"], "repeat": repeat,
-                             "seed": seed, "scores": scores})
+                    _append({
+                        "kind": "judge", "run_id": run_id,
+                        "case_id": case["id"], "repeat": repeat,
+                        "seed": seed, "seed_supported": False,
+                        "scores": scores,
+                    })
                     judge_keys.add(jkey)
-                    # attach judge scores to trial records (rewrite lines)
-                    _attach_judge_scores(results_path, case["id"], repeat, scores)
 
-    trials = load_trials(results_path)
-    summary = summarize_trials(trials)
-    policy = build_routing_policy(summary)
+    trials = load_trials(results_path, run_id)
+    judge_events = load_judge_events(results_path, run_id)
+    summary = summarize_trials(trials, judge_events)
+    policy = build_routing_policy(summary, sealed=(split == "sealed"))
     (out_dir / "benchmark_summary.json").write_text(json.dumps(summary, indent=2))
     report = build_report(summary, meta, policy)
     (out_dir / "benchmark_report.md").write_text(report)
     (out_dir / "proposed_routing_policy.yaml").write_text(_dump_yaml(policy))
-    summary["_meta"].update({"commit": meta["commit"], "dataset": meta["dataset"],
+    summary["_meta"].update({"run_id": run_id, "commit": commit, "dataset": path.name,
                              "timestamp": meta["timestamp"]})
     return {"summary": summary, "policy": policy, "trials": len(trials)}
-
-
-def _attach_judge_scores(results_path: Path, case_id: str, repeat: int, scores: dict) -> None:
-    """Rewrite the JSONL with judge scores attached to matching trial records."""
-    if not results_path.exists():
-        return
-    lines = []
-    for line in results_path.read_text().splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("kind") == "trial" and record.get("case_id") == case_id:
-            # match by repeat via trial_id suffix
-            tid = record.get("trial_id", "")
-            if tid.endswith(f":{repeat}") and record.get("mode") in scores:
-                record["judge_score"] = scores[record["mode"]]
-        lines.append(json.dumps(record))
-    results_path.write_text("\n".join(lines) + "\n")
 
 
 def _dataset_checksum(path: Path) -> str:
@@ -947,15 +1084,19 @@ def _dump_yaml(data: dict) -> str:
     return _yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
 
 
-def main_live(split: str = "dev", limit: int | None = None, repeats: int = 3,
-              out_dir: str = "artifacts", resume: bool = True):
+def main_live(split: str = "dev", limit: int | None = None, per_category_limit: int | None = None,
+              repeats: int = 3, out_dir: str = "artifacts", resume: bool = True,
+              sealed_path: str | None = None, unrestricted: bool = False):
     """Sync entry point for the CLI: builds a router client and runs."""
+    from ..config import load_settings
+
     settings = load_settings()
     client = RouterClient(settings.router_base_url, settings.router_api_key, timeout=120)
     try:
         result = asyncio.run(run_benchmark4(
-            client, settings, split=split, repeats=repeats, case_limit=limit,
-            out_dir=Path(out_dir), resume=resume,
+            client, settings, split=split, sealed_path=sealed_path,
+            repeats=repeats, case_limit=limit, per_category_limit=per_category_limit,
+            out_dir=Path(out_dir), resume=resume, equal_budget=not unrestricted,
         ))
         print(json.dumps(result["summary"]["_meta"], indent=2))
         return result

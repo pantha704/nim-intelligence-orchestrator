@@ -584,16 +584,17 @@ async def execute_dag(client: RouterClient, ctx: RunContext, dag_cfg: DagConfig)
         ctx.answer = "No subtasks to execute."
         return
 
-    # The DAG runs under its own limits on the shared budget. The compiler
-    # call already counted, so max_model_calls bounds the whole request.
-    from .budget import BudgetLimits
+    # The DAG runs under its own limits on the shared budget — UNLESS the
+    # benchmark pinned an equal budget across all modes (budget_override).
+    if getattr(ctx, "budget_override", None) is None:
+        from .budget import BudgetLimits
 
-    ctx.budget.limits = BudgetLimits(
-        max_model_calls=dag_cfg.max_model_calls,
-        max_concurrent_agents=dag_cfg.max_concurrent_calls,
-        max_total_agents=ctx.budget.limits.max_total_agents,
-    )
-    ctx.budget._semaphore = asyncio.Semaphore(dag_cfg.max_concurrent_calls)
+        ctx.budget.limits = BudgetLimits(
+            max_model_calls=dag_cfg.max_model_calls,
+            max_concurrent_agents=dag_cfg.max_concurrent_calls,
+            max_total_agents=ctx.budget.limits.max_total_agents,
+        )
+        ctx.budget._semaphore = asyncio.Semaphore(dag_cfg.max_concurrent_calls)
 
     nodes = build_dag(ctx.task_spec)  # raises DagValidationError on invalid graphs
     ctx.dag_nodes = nodes

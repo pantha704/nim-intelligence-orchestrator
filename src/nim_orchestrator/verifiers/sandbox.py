@@ -22,6 +22,14 @@ from dataclasses import dataclass
 
 ALLOWED_LANGUAGES = ("python", "py")
 
+# Counts actual secure-sandbox executions (benchmark provenance).
+_SECURE_SANDBOX_RUNS = 0
+
+
+def sandbox_run_count() -> int:
+    """Total secure-sandbox executions since process start."""
+    return _SECURE_SANDBOX_RUNS
+
 # Pinned by digest for reproducibility — never resolved at request time.
 DOCKER_IMAGE = "python:3.11-slim@sha256:94c50be2dc994b873b55bc123e95e6dbade08095b3dfd790f51c34de3f08cbb7"
 _BACKEND_ORDER: list[str] = ["docker", "bubblewrap"]
@@ -433,6 +441,8 @@ def run_secure_sandbox(
             error="no secure sandbox backend available (docker or bwrap) — refusing host subprocess execution",
             isolation="none",
         )
+    global _SECURE_SANDBOX_RUNS
+    _SECURE_SANDBOX_RUNS += 1
     return backend.run(
         code,
         files=files,

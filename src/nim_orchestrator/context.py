@@ -91,6 +91,7 @@ class RunContext:
     clarification_question: str = ""
     trace: list[str] = field(default_factory=list)
     budget: ExecutionBudget = field(default_factory=ExecutionBudget)
+    budget_override: object | None = None  # benchmark-equal budget limits (BudgetLimits)
     policy: PolicyResult = field(default_factory=PolicyResult)
     candidates: list[Candidate] = field(default_factory=list)
     dag_nodes: list = field(default_factory=list)

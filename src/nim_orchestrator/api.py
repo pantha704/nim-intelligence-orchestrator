@@ -14,6 +14,7 @@ async def handle_intelligence_request(
     raw_prompt: str,
     force_mode: str | None = None,
     dag_config=None,
+    budget_limits=None,
 ) -> dict:
     """Main entry point.
 
@@ -22,7 +23,8 @@ async def handle_intelligence_request(
     The API executes PolicyResult — all routing decisions live in PolicyEngine.
 
     dag_config overrides settings.dag (used by the benchmark to toggle
-    specialists/sandbox per trial).
+    specialists/sandbox per trial). budget_limits overrides the default
+    ExecutionBudget so benchmark modes compete under identical limits.
     """
 
     # --- Stage 0: Transport gate (minimal — size, encoding, emptiness only) ---
@@ -37,6 +39,9 @@ async def handle_intelligence_request(
 
     # Single mutable execution state for the entire request
     ctx = RunContext(raw_prompt=gate.raw_prompt)
+    if budget_limits is not None:
+        ctx.budget.limits = budget_limits
+        ctx.budget_override = budget_limits
     ctx.start()
     engine = PolicyEngine(settings)
 
