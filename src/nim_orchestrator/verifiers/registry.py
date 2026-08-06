@@ -10,8 +10,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .external_checks import safety_scan
-from .sandbox import run_in_sandbox
-from .semantic_checks import extract_factual_claims, verify_math_claims
+from .math_eval import ExpressionError, safe_eval_expression
+from .sandbox import run_secure_sandbox
+from .semantic_checks import extract_claims, extract_factual_claims
 
 
 class ToolUnavailableError(RuntimeError):
@@ -180,8 +181,8 @@ def verifier_python_syntax(answer: str, **kwargs) -> tuple[str, str, str]:
 
 
 def _make_sandbox_verifier(tools: ToolRegistry):
-    """verifier_code_sandbox bound to the tool registry — a disabled sandbox
-    tool degrades the check to unverified via ToolUnavailableError."""
+    """verifier_code_sandbox bound to the tool registry — a missing secure
+    backend or disabled tool degrades the check to unverified (fail closed)."""
 
     def verifier_code_sandbox(answer: str, timeout_seconds: float = 5.0, **kwargs) -> tuple[str, str, str]:
         blocks = _extract_python_blocks(answer)
@@ -189,10 +190,13 @@ def _make_sandbox_verifier(tools: ToolRegistry):
             return "unverified", "no code blocks to run", ""
         results = []
         for i, code in enumerate(blocks):
-            results.append(tools.call("sandbox", code=code, timeout_seconds=timeout_seconds))
+            r = tools.call("sandbox", code=code, timeout_seconds=timeout_seconds)
+            if r.status == "unavailable":
+                raise ToolUnavailableError(r.error)
+            results.append(r)
         if all(r.ok for r in results):
             ev = "; ".join(f"block {i}: exit 0" for i, r in enumerate(results))
-            return "pass", f"{len(results)} block(s) ran in sandbox", ev
+            return "pass", f"{len(results)} block(s) ran in sandbox ({results[0].backend})", ev
         bad = [f"block {i}: {r.status}" for i, r in enumerate(results) if not r.ok]
         return "fail", "sandbox execution failed", "; ".join(bad[:5])
 
@@ -200,34 +204,111 @@ def _make_sandbox_verifier(tools: ToolRegistry):
 
 
 def _make_test_runner_verifier(tools: ToolRegistry):
-    """test runner bound to the sandbox tool (tests execute inside it)."""
+    """Test runner bound to the sandbox tool: supplied code blocks are written
+    into real sandbox files, real test_* callables are discovered and invoked,
+    and passed/failed/collected counts are reported.
+
+    No tests found → UNVERIFIED (never positive evidence).
+    """
 
     def verifier_test_runner(answer: str, timeout_seconds: float = 5.0, **kwargs) -> tuple[str, str, str]:
         blocks = _extract_python_blocks(answer)
         if not blocks:
-            return "pass", "no code blocks to test — nothing to run", ""
+            return "unverified", "no code blocks to test", ""
         tests = [code for code in blocks if "def test_" in code]
         if not tests:
-            return "pass", "no test_* functions found — nothing to run", ""
-        wrapper = (
-            "import sys\n"
-            "results = []\n"
-            + "\n".join(f"exec(open('block{i}.py').read(), globals())" for i in range(len(tests)))
-            + "\n"
-            + "\n".join(
-                f"try:\n    test_{i}(); results.append(({i}, 'pass'))\n"
-                f"except Exception as e:\n    results.append(({i}, 'fail:' + repr(e)))"
-                for i in range(len(tests))
-            )
-            + "\nprint(results)\n"
-        )
-        sandbox_code = "\n\n".join(tests) + "\n\n" + wrapper
-        r = tools.call("sandbox", code=sandbox_code, timeout_seconds=timeout_seconds)
+            return "unverified", "no test_* functions found — nothing was tested", ""
+
+        n = len(tests)
+        lines = [
+            "collected = passed = failed = 0",
+            "failures = []",
+        ]
+        for i in range(n):
+            lines.extend([
+                f"ns_{i} = {{}}",
+                "try:",
+                f"    exec(open('block{i}.py').read(), ns_{i})",
+                "except Exception as e:",
+                f"    print('IMPORT_FAIL', {i}, repr(e))",
+            ])
+        for i in range(n):
+            lines.extend([
+                f"for name, obj in sorted(ns_{i}.items()):",
+                "    if name.startswith('test_') and callable(obj):",
+                "        collected += 1",
+                "        try:",
+                "            obj(); passed += 1",
+                "        except Exception as e:",
+                "            failed += 1; failures.append(f'{name}: {e!r}')",
+            ])
+        lines.extend([
+            "print('COLLECTED', collected, 'PASSED', passed, 'FAILED', failed)",
+            "print('FAILURES', failures)",
+        ])
+        runner = "\n".join(lines)
+
+        files = {f"block{i}.py": code for i, code in enumerate(tests)}
+        r = tools.call("sandbox", code=runner, files=files, timeout_seconds=timeout_seconds)
+        if r.status == "unavailable":
+            raise ToolUnavailableError(r.error)
         if not r.ok:
             return "fail", f"test run failed: {r.status} {r.stderr[:200]}", ""
-        return "pass", r.stdout.strip()[:300], ""
+
+        import re as _re
+
+        m = _re.search(r"COLLECTED (\d+) PASSED (\d+) FAILED (\d+)", r.stdout)
+        if not m:
+            return "fail", f"test runner produced no summary: {r.stdout[:200]}", ""
+        collected, passed, failed = (int(v) for v in m.groups())
+        if collected == 0:
+            return "unverified", "no test_* callables discovered — nothing was tested", ""
+        if "IMPORT_FAIL" in r.stdout:
+            return "fail", "test module failed to import", r.stdout.strip()[:300]
+        if failed > 0:
+            return "fail", f"{failed}/{collected} tests failed", r.stdout.strip()[:300]
+        return "pass", f"{passed}/{collected} tests passed", r.stdout.strip()[:300]
 
     return verifier_test_runner
+
+
+def _make_math_semantic_verifier(tools: ToolRegistry):
+    """Math verification where every computation goes through the registered
+    safe evaluator tool — provenance is truthful."""
+
+    def verifier_math_semantic(answer: str, **kwargs) -> tuple[str, str, str]:
+        claims = extract_claims(answer)
+
+        def _evaluate(left: float, operator: str, right: float) -> float:
+            expr = f"{left:g} {operator} {right:g}"
+            return float(tools.call("math_evaluator", expr=expr))
+
+        affirmative_errors: list[str] = []
+        affirmative_correct: list[str] = []
+        for claim in claims:
+            if claim.negated:
+                continue
+            for eq in claim.equalities:
+                try:
+                    actual = _evaluate(eq.left, eq.operator, eq.right)
+                except ExpressionError as e:
+                    affirmative_errors.append(f"{eq.text} ({e})")
+                    continue
+                if abs(actual - eq.expected) < 0.01:
+                    affirmative_correct.append(eq.text)
+                else:
+                    affirmative_errors.append(f"{eq.text} (actual {actual:g})")
+
+        if affirmative_errors:
+            return "fail", f"{len(affirmative_errors)} wrong affirmative equation(s)", "; ".join(affirmative_errors[:5])
+        if affirmative_correct:
+            return "pass", f"{len(affirmative_correct)} verified equation(s)", "; ".join(affirmative_correct[:5])
+
+        if any(c.negated and c.equalities for c in claims):
+            return "unverified", "equations appear only in negated sentences — not counted as evidence", ""
+        return "unverified", "no affirmative checkable equations in answer", ""
+
+    return verifier_math_semantic
 
 
 def verifier_claim_extraction(answer: str, **kwargs) -> tuple[str, str, str]:
@@ -285,12 +366,11 @@ def build_default_registry(sandbox_enabled: bool = False) -> VerifierRegistry:
     also enables the test runner (it runs inside the sandbox).
     """
     tools = ToolRegistry()
-    tools.register("sandbox", "isolated code sandbox (network-off, limited)", run_in_sandbox,
+    tools.register("sandbox", "secure isolated sandbox (docker/bwrap; fail-closed)", run_secure_sandbox,
                    disabled_by_default=not sandbox_enabled)
-    tools.register("math_evaluator", "safe AST expression evaluator", None,
-                   disabled_by_default=False)
+    tools.register("math_evaluator", "safe AST expression evaluator", safe_eval_expression)
     tools.register("python_syntax", "AST python syntax checker", None)
-    tools.register("test_runner", "runs test_* functions inside the sandbox", None,
+    tools.register("test_runner", "runs test_* functions inside the secure sandbox", None,
                    disabled_by_default=not sandbox_enabled)
     tools.register("claim_extractor", "sentence-level claim extraction", None)
     tools.register("citation_source", "external citation/source lookup — NOT IMPLEMENTED", None,
@@ -299,19 +379,21 @@ def build_default_registry(sandbox_enabled: bool = False) -> VerifierRegistry:
     tools.register("coverage_checker", "requirement/constraint coverage", None)
 
     verifiers = VerifierRegistry(tools)
-    verifiers.register("python_syntax", verifier_python_syntax, tool_id="python_syntax",
+    # In-process verifiers: no external tool is invoked → tool_id stays ""
+    verifiers.register("python_syntax", verifier_python_syntax,
                        description="parse Python code blocks with AST")
     verifiers.register("code_sandbox", _make_sandbox_verifier(tools), tool_id="sandbox",
-                       description="run code blocks in the isolated sandbox")
-    verifiers.register("test_runner", _make_test_runner_verifier(tools), tool_id="test_runner",
-                       description="execute test_* functions in the sandbox")
-    verifiers.register("math_semantic", lambda answer, **kw: verify_math_claims(answer),
-                       tool_id="math_evaluator", description="negation-aware equation verification")
-    verifiers.register("claim_extraction", verifier_claim_extraction, tool_id="claim_extractor",
+                       description="run code blocks in the secure sandbox (fail-closed)")
+    verifiers.register("test_runner", _make_test_runner_verifier(tools), tool_id="sandbox",
+                       description="execute test_* functions inside the secure sandbox")
+    # math_semantic evaluates every equation through the registered evaluator tool
+    verifiers.register("math_semantic", _make_math_semantic_verifier(tools), tool_id="math_evaluator",
+                       description="negation-aware equation verification via safe evaluator")
+    verifiers.register("claim_extraction", verifier_claim_extraction,
                        description="extract claims; external confirmation unavailable")
-    verifiers.register("security_checklist", verifier_security_checklist, tool_id="security_checklist",
+    verifiers.register("security_checklist", verifier_security_checklist,
                        description="structured security dimensions + safety scan")
-    verifiers.register("coverage", verifier_coverage, tool_id="coverage_checker",
+    verifiers.register("coverage", verifier_coverage,
                        description="requirement/constraint coverage")
     return verifiers
 

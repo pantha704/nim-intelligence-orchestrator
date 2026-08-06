@@ -11,7 +11,6 @@ from nim_orchestrator.specialists import (
     SPECIALISTS,
     Specialist,
     assign_specialist,
-    available_models,
 )
 
 ROUTER_AVAILABLE = os.environ.get("NIM_ROUTER_AVAILABLE", "0") == "1"
@@ -93,15 +92,19 @@ class TestAssignment:
     def test_default_general_reasoning(self):
         assert assign_specialist("Think carefully about the meaning of life").name == "general_reasoning"
 
-    def test_available_models_respects_configuration(self):
-        spec = SPECIALISTS["coding"]
-        models = available_models(spec, {"deepseek-v4-flash"})
-        assert models == ["deepseek-v4-flash"]
+    def test_model_selection_respects_preferred_models(self):
+        """ModelRegistry (scored) replaces the legacy alphabetical helper."""
+        from nim_orchestrator.models import ModelRegistry
 
-    def test_available_models_prefers_configured(self):
-        spec = SPECIALISTS["research"]  # prefers deepseek-v4-flash then glm-5.2
-        models = available_models(spec, {"glm-5.2", "minimax-3"})
-        assert models == ["glm-5.2"]
+        registry = ModelRegistry.from_configured(["deepseek-v4-flash", "glm-5.2"])
+        assert registry.select("coding", ["deepseek-v4-flash", "deepseek-v4-pro"]) == "deepseek-v4-flash"
+
+    def test_model_selection_prefers_configured_specialist(self):
+        from nim_orchestrator.models import ModelRegistry
+
+        # research prefers deepseek-v4-flash then glm-5.2; only glm configured
+        registry = ModelRegistry.from_configured(["glm-5.2", "minimax-3"])
+        assert registry.select("research", ["deepseek-v4-flash", "glm-5.2"]) == "glm-5.2"
 
 
 # ============================================================

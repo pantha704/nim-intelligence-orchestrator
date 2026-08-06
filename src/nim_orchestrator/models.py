@@ -42,6 +42,7 @@ class ModelInfo:
     health: str = "unknown"  # unknown | healthy | degraded | down
     latency_ms_history: list[float] = field(default_factory=list)
     suitability: dict[str, float] = field(default_factory=dict)
+    error_count: int = 0
 
     @property
     def mean_latency_ms(self) -> float:
@@ -96,6 +97,31 @@ class ModelRegistry:
     def latency_history(self, name: str) -> list[float]:
         info = self._models.get(name)
         return list(info.latency_ms_history) if info else []
+
+    def record_outcome(self, name: str, status: str, latency_ms: float = 0.0) -> None:
+        """Feed a live call outcome into the registry.
+
+        success → latency history recorded, health restored;
+        timeout/error → error_count grows: degraded after 1, down after 2.
+        """
+        info = self._models.get(name)
+        if info is None:
+            return
+        if status == "success":
+            info.latency_ms_history.append(max(latency_ms, 0.0))
+            info.error_count = 0
+            info.health = "healthy"
+        elif status in ("timeout", "error"):
+            info.error_count += 1
+            if info.error_count >= 2:
+                info.health = "down"
+            elif info.error_count >= 1:
+                info.health = "degraded"
+
+    def mark_router_unreachable(self) -> None:
+        """Router health probe failed — every model becomes degraded."""
+        for name in self._order:
+            self._models[name].health = "degraded"
 
     def select(self, specialist_name: str, preferred: list[str] | None = None) -> str | None:
         """Pick the best model for a specialist by suitability, preference,

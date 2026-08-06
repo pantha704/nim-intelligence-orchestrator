@@ -94,6 +94,7 @@ class RunContext:
     policy: PolicyResult = field(default_factory=PolicyResult)
     candidates: list[Candidate] = field(default_factory=list)
     dag_nodes: list = field(default_factory=list)
+    model_registry: object | None = None  # request-persistent ModelRegistry
     anon: AnonMapping | None = None
     critique: dict[str, str] = field(default_factory=dict)
     clustering: ClusteringResult | None = None

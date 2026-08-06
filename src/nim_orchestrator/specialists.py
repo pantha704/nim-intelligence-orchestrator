@@ -182,14 +182,3 @@ def assign_specialist(text: str) -> Specialist:
         return SPECIALISTS["systems_architecture"]
 
     return SPECIALISTS["general_reasoning"]
-
-
-def available_models(specialist: Specialist, configured_models: set[str]) -> list[str]:
-    """Preferred models that are actually configured; falls back to the first
-    configured model (registration order)."""
-    matched = [m for m in specialist.preferred_models if m in configured_models]
-    if matched:
-        return matched
-    if configured_models:
-        return [min(configured_models)]
-    return list(specialist.preferred_models)
